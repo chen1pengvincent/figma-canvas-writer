@@ -1,0 +1,10 @@
+# 追加到 ~/.dsh/profiles/desktop/cordis.patch.yml
+- insert:
+    - id: figma-canvas-writer
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: figma-canvas-writer
+        transport: stdio
+        command: <Node 绝对路径>
+        args:
+          - <本仓库路径>/bridge/mcp-bridge.js

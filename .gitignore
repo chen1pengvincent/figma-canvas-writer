@@ -1,0 +1,19 @@
+# 依赖目录（由 npm install 生成）
+node_modules/
+bridge/node_modules/
+
+# 运行时生成的鉴权/审计文件（含 token，绝不能入仓）
+# 注意：这些文件实际位于用户主目录（~/.figma-canvas-writer/ 或 ~/.dsh-figma-bridge/），
+# 不在仓库内，这里仅为防御性忽略（防止误把本地测试产物加进来）
+bridge-token
+audit.log
+*.bak
+
+# 系统/编辑器文件
+.DS_Store
+Thumbs.db
+*.log
+
+# 环境变量/本地覆盖
+.env
+.env.local

@@ -1,0 +1,22 @@
+{
+  "name": "Figma Canvas Writer",
+  "id": "figma-canvas-writer",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": [
+    "figma"
+  ],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": [
+      "ws://127.0.0.1:9753",
+      "ws://localhost:9753"
+    ],
+    "devAllowedDomains": [
+      "ws://127.0.0.1:9753",
+      "ws://localhost:9753"
+    ],
+    "reasoning": "本插件是普通 Figma 插件（editorType: figma，非 Dev Mode），作为 WebSocket 客户端仅连接本机 Figma Canvas Writer 桥接服务（127.0.0.1:9753/plugin）以在画布上创建/修改节点，不访问任何远程主机，故只放行本地回环地址的 ws:// 连接。"
+  }
+}

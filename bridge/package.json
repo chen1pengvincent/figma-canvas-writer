@@ -1,0 +1,14 @@
+{
+  "name": "figma-canvas-writer-bridge",
+  "version": "1.0.0",
+  "description": "Figma Canvas Writer 桥接服务：MCP stdio server <-> 本机 WebSocket server，把任意 MCP agent 的工具调用转发给 Figma 插件在画布上执行（create/modify/delete/setText 等）。",
+  "type": "module",
+  "private": true,
+  "main": "mcp-bridge.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

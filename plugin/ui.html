@@ -1,0 +1,103 @@
+<!-- figma-canvas-writer/plugin/ui.html -->
+<!-- Figma Canvas Writer —— Figma 插件连接状态面板：显示桥接状态（绿/红点）、编辑 token、保存并重连 -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Figma Canvas Writer</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; padding: 12px; font-size: 12px;
+    background: var(--figma-color-bg, #ffffff);
+    color: var(--figma-color-text, #1f1f1f);
+    user-select: none;
+  }
+  #statusRow { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #b3b3b3; flex: none; }
+  .dot.ok { background: #0f9d58; }     /* 绿：已授权/已连接 */
+  .dot.bad { background: #ea4335; }    /* 红：鉴权失败/断开 */
+  .dot.warn { background: #f9ab00; }   /* 黄：连接中 */
+  #statusText { font-weight: 600; }
+  #detail { color: #777; margin-bottom: 10px; line-height: 1.4; min-height: 15px; word-break: break-all; }
+  label { display: block; margin-bottom: 4px; color: #666; }
+  input {
+    width: 100%; padding: 5px 6px;
+    border: 1px solid #d0d0d0; border-radius: 4px;
+    font-size: 12px; outline: none;
+    background: var(--figma-color-bg, #fff); color: var(--figma-color-text, #1f1f1f);
+  }
+  input:focus { border-color: #0d99ff; }
+  button {
+    margin-top: 8px; width: 100%; padding: 6px 0;
+    border: none; border-radius: 4px;
+    background: #0d99ff; color: #fff; font-size: 12px; cursor: pointer;
+  }
+  button:active { opacity: 0.85; }
+  .hint { margin-top: 8px; font-size: 11px; color: #888; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div id="statusRow">
+    <span id="dot" class="dot"></span>
+    <span id="statusText">初始化…</span>
+  </div>
+  <div id="detail"></div>
+
+  <label for="pair">6 位配对码</label>
+  <input id="pair" type="text" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="桥接启动时 stderr 打印的 6 位数字" />
+
+  <button id="saveBtn">配对</button>
+
+  <div class="hint">配对码由桥接首次启动时打印（10 分钟有效、单次）。配对成功后真 token 自动经本机加密通道下发，无需复制。</div>
+
+<script>
+  // —— 接收主线程（code.js）推送的状态 ——
+  function mapStateText(s) {
+    return ({
+      idle: '未启动',
+      connecting: '连接中…',
+      connected: '已连接，鉴权中…',
+      authorized: '已授权（桥接在线）',
+      auth_failed: '鉴权失败',
+      disconnected: '已断开，自动重连中…',
+    }[s] || s);
+  }
+
+  function setState(state, detail) {
+    const dot = document.getElementById('dot');
+    document.getElementById('statusText').textContent = mapStateText(state);
+    // 绿点=authorized/connected；红点=auth_failed/disconnected；黄点=connecting；灰=idle
+    if (state === 'authorized' || state === 'connected') dot.className = 'dot ok';
+    else if (state === 'auth_failed' || state === 'disconnected') dot.className = 'dot bad';
+    else if (state === 'connecting') dot.className = 'dot warn';
+    else dot.className = 'dot';
+    document.getElementById('detail').textContent = detail || '';
+  }
+
+  // code.js 通过 figma.ui.postMessage 发送，落在 window message 事件的 pluginMessage 上
+  window.onmessage = (event) => {
+    const msg = event.data && event.data.pluginMessage;
+    if (!msg) return;
+    if (msg.type === 'status') setState(msg.state, msg.detail);
+    else if (msg.type === 'pairResult' && msg.ok === false) {
+      setState('auth_failed', msg.detail || '配对失败');
+    }
+  };
+
+  // —— 发送 6 位配对码换取 token ——
+  document.getElementById('saveBtn').addEventListener('click', () => {
+    const code = document.getElementById('pair').value.trim();
+    if (!/^\d{6}$/.test(code)) { setState('auth_failed', '配对码必须是 6 位数字'); return; }
+    parent.postMessage({ pluginMessage: { type: 'pair', code } }, '*');
+    setState('connecting', '配对中…');
+    document.getElementById('pair').value = '';
+  });
+
+  // 面板打开时向主线程查询一次当前状态
+  parent.postMessage({ pluginMessage: { type: 'queryState' } }, '*');
+</script>
+</body>
+</html>

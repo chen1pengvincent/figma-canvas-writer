@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "figma-canvas-writer": {
+      "command": "<Node 绝对路径>",
+      "args": [
+        "<本仓库路径>/bridge/mcp-bridge.js"
+      ]
+    }
+  }
+}
