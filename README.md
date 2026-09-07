@@ -9,7 +9,7 @@
 
 ## 是什么
 
-DSH/Codex 这类 AI 助手（MCP agent）目前只能**读** Figma 画布（通过 Figma Dev Mode MCP），不能写。这个组件填补了"写"的缺口：
+DSH 这类 AI 助手（MCP agent）目前只能**读** Figma 画布（通过 Figma Dev Mode MCP），不能写。这个组件填补了"写"的缺口：
 
 - **写入**：在画布上创建/修改/删除节点（矩形/椭圆/文本/框架/线条）、编辑文本内容、改白名单属性
 - **通用**：任何支持 MCP stdio 的 agent 都能用（Claude Desktop / Cursor / Codex / Windsurf / VS Code Copilot / DSH / …）
