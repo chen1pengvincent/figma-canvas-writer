@@ -650,7 +650,11 @@ function startStdioServer() {
     });
   });
 
-  rl.on('close', () => { shutdown(); });
+  rl.on('close', () => {
+    // stdio(MCP 通道)关闭 = agent 不再调用工具, 但 WS server 必须继续常驻供插件连接
+    // 不退出进程, 只记录(插件可独立于 stdio 连接)
+    log('stdio(MCP 通道)已关闭，WS server 继续运行供插件连接');
+  });
 }
 
 async function dispatch(msg) {
