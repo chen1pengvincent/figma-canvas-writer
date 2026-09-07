@@ -327,6 +327,12 @@ async function handleCreateNode(p) {
     }
     if (x !== undefined) node.x = x;
     if (y !== undefined) node.y = y;
+    // 修复: createNode 之前完全没应用 props(fills/strokes/rotation 等), 导致颜色等属性丢失。
+    // 在定位后统一应用 props(经 validateModifyProps 做 hex 颜色转换 + applyProps 应用)
+    if (p.props !== undefined && p.props !== null) {
+      const extraProps = validateModifyProps(p.props);
+      await applyProps(node, extraProps);
+    }
     return { id: node.id, name: node.name, type: node.type };
   });
 }
