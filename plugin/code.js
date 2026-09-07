@@ -3,7 +3,7 @@
 // 作为 WebSocket 客户端连接本机 Figma Canvas Writer 桥接服务（Figma 沙箱不能监听端口，只能主动外连），
 // 接收 {type:"cmd", id, command, params} 命令并执行画布操作，返回 {type:"resp", ...}。
 
-const BRIDGE_URL = 'ws://127.0.0.1:9753/plugin'; // 仅本机回环桥接地址
+const BRIDGE_URL = 'ws://localhost:9753/plugin'; // 仅本机回环桥接地址
 const PROTOCOL = 1;                              // 与桥接侧约定的握手协议版本
 const AUTH_TOKEN_KEY = 'bridgeToken';            // token 存 Figma clientStorage
 const RECONNECT_MIN_MS = 1000;                   // 断线重连指数退避下限 1s
