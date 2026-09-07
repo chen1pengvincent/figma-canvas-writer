@@ -108,14 +108,14 @@ async function withPageContext(page, fn) {
 // 对目标节点执行 fn(node)；自动切到其所在页面并重新按 id 取引用
 // （原因：切页后旧的节点对象引用可能失效，必须重新 getNodeById）。
 async function withNode(nodeId, fn) {
-  const first = figma.getNodeById(String(nodeId));
+  const first = await figma.getNodeByIdAsync(String(nodeId));
   if (!first) throw appErr('NODE_NOT_FOUND', `找不到节点: ${nodeId}`);
   if (first.type === 'DOCUMENT' || first.type === 'PAGE') {
     throw appErr('INVALID_TARGET', '不能对文档/页面节点执行该操作');
   }
   const page = pageOfNode(first);
   return withPageContext(page, async () => {
-    const node = figma.getNodeById(String(nodeId));
+    const node = await figma.getNodeByIdAsync(String(nodeId));
     if (!node) throw appErr('NODE_NOT_FOUND', `找不到节点: ${nodeId}`);
     return fn(node);
   });
@@ -288,7 +288,7 @@ async function handleCreateNode(p) {
   let parentPre = null;
   if (p.parentId !== undefined && p.parentId !== null) {
     parentId = requireStr(p.parentId, 'parentId');
-    parentPre = figma.getNodeById(parentId);
+    parentPre = await figma.getNodeByIdAsync(parentId);
     if (!parentPre) throw appErr('NODE_NOT_FOUND', `找不到父节点: ${parentId}`);
     if (parentPre.type !== 'FRAME') throw appErr('INVALID_PARAM', 'parentId 必须是 FRAME 节点');
   }
@@ -297,7 +297,7 @@ async function handleCreateNode(p) {
 
   return withPageContext(targetPage, async () => {
     // 原因：切页后需重新按 id 取父节点引用
-    const parent = parentId ? figma.getNodeById(parentId) : null;
+    const parent = parentId ? await figma.getNodeByIdAsync(parentId) : null;
     let node = null;
     if (type === 'RECTANGLE') node = figma.createRectangle();
     else if (type === 'ELLIPSE') node = figma.createEllipse();
