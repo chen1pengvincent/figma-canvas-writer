@@ -175,8 +175,12 @@ function validatePaints(v, name) {
       throw appErr('INVALID_PARAM', `${name} 元素 type 非法`);
     }
     if (paint.type === 'SOLID') {
-      if (!isPlainObject(paint.color)) throw appErr('INVALID_PARAM', 'SOLID 填充需要 color');
-      const c = paint.color;
+      // 支持两种颜色格式: {r,g,b} 对象(0..1) 或 "#RRGGBB"/"#RGB" hex 字符串(自动转 {r,g,b})
+      let c = paint.color;
+      if (typeof c === 'string') {
+        c = hexToRgb01(c); // hex 字符串转 {r,g,b}(0..1); 非法 hex 会抛错
+      }
+      if (!isPlainObject(c)) throw appErr('INVALID_PARAM', 'SOLID 填充需要 color');
       for (const ch of ['r', 'g', 'b']) {
         if (!isFiniteNum(c[ch], 0, 1)) throw appErr('INVALID_PARAM', `color.${ch} 需在 [0,1]`);
       }
@@ -190,6 +194,20 @@ function validatePaints(v, name) {
     }
   }
   return out;
+}
+
+// hex 颜色字符串转 {r,g,b}(0..1 浮点); 支持 "#RRGGBB" 和 "#RGB", 非法格式抛 INVALID_PARAM
+function hexToRgb01(hex) {
+  if (typeof hex !== 'string') throw appErr('INVALID_PARAM', 'color 必须是字符串或 {r,g,b} 对象');
+  const m = hex.trim().match(/^#?([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/);
+  if (!m) throw appErr('INVALID_PARAM', `非法 hex 颜色: ${hex}（需 #RRGGBB 或 #RGB）`);
+  let h = m[1];
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  return {
+    r: parseInt(h.slice(0, 2), 16) / 255,
+    g: parseInt(h.slice(2, 4), 16) / 255,
+    b: parseInt(h.slice(4, 6), 16) / 255,
+  };
 }
 
 function validateModifyProps(props) {
