@@ -1,6 +1,6 @@
 // figma-canvas-writer/plugin/code.js
 // Figma Canvas Writer —— Figma 插件主线程（普通插件，在 Figma 设计文件内运行，有画布写权限）。
-// 作为 WebSocket 客户端连接本机 Figma Canvas Writer 桥接服务（Figma 沙箱不能监听端口，只能主动外连），
+// 作为命令执行器：经 ui.html(iframe, 有 WebSocket) 转发桥接命令，执行画布操作后回传结果。
 // 接收 {type:"cmd", id, command, params} 命令并执行画布操作，返回 {type:"resp", ...}。
 
 const BRIDGE_URL = 'ws://localhost:9753/plugin'; // 仅本机回环桥接地址
@@ -22,7 +22,6 @@ const PAINT_TYPES = new Set([
   'GRADIENT_DIAMOND', 'IMAGE', 'VIDEO', 'EMOJI',
 ]);
 
-let socket = null;            // 当前 WebSocket 连接
 let reconnectDelay = RECONNECT_MIN_MS;
 let reconnectTimer = null;
 let connectionState = 'idle'; // idle|connecting|connected|authorized|auth_failed|disconnected
@@ -421,160 +420,81 @@ const HANDLERS = {
   setText: handleSetText,
 };
 
-async function handleIncoming(raw) {
-  let msg;
-  try { msg = JSON.parse(String(raw)); }
-  catch (e) { log('收到非 JSON 消息，忽略'); return; }
-  if (!isPlainObject(msg)) return;
-  if (msg.type === 'auth_ack') { handleAuthAck(msg); return; }
-  if (msg.type === 'pair_ack') { handlePairAck(msg); return; }
-  if (msg.type !== 'cmd') return; // 忽略其它消息类型
 
-  const id = msg.id === undefined || msg.id === null ? null : msg.id;
-  if (id === null) return;
-  const command = msg.command;
-  const params = isPlainObject(msg.params) ? msg.params : {};
-  if (typeof command !== 'string' || !(command in HANDLERS)) {
-    sendResponse(id, false, { code: 'UNKNOWN_COMMAND', message: `未知命令: ${String(command)}` });
-    return;
-  }
+// ---------------- 通信层（postMessage ↔ ui.html；主线程无 WebSocket，网络全在 iframe） ----------------
+// 架构：主线程(本文件, QuickJS, 有 Plugin API, 无 WebSocket) ←→ ui.html(iframe, 有 WebSocket) ←→ 桥接
+// 桥接命令经 ui.html 转发给主线程执行，结果原路返回。
+
+function postToUi(obj) {
+  try { figma.ui.postMessage(obj); } catch (e) { /* UI 未就绪时忽略 */ }
+}
+
+// 执行命令并回传结果给 ui.html（由它经 WebSocket 回桥接）
+async function execAndReply(id, command, params) {
   try {
+    if (!(command in HANDLERS)) {
+      postToUi({ type: 'exec_result', id, ok: false, error: { code: 'UNKNOWN_COMMAND', message: `未知命令: ${String(command)}` } });
+      return;
+    }
     const data = await HANDLERS[command](params);
-    sendResponse(id, true, data);
+    postToUi({ type: 'exec_result', id, ok: true, data });
   } catch (err) {
-    log('命令执行失败', command, err && err.message);
     const code = err && err.code ? err.code : 'PLUGIN_ERROR';
     const message = err && err.message ? err.message : String(err);
-    sendResponse(id, false, { code, message });
+    postToUi({ type: 'exec_result', id, ok: false, error: { code, message } });
   }
-}
-
-// 统一响应格式：成功 {ok:true,data} / 失败 {ok:false,error:{code,message}}
-function sendResponse(id, ok, dataOrError) {
-  if (!wsOpen()) return;
-  const payload = ok
-    ? { type: 'resp', id, ok: true, data: dataOrError }
-    : { type: 'resp', id, ok: false, error: dataOrError };
-  try { socket.send(JSON.stringify(payload)); } catch (e) { log('发送响应失败', e && e.message); }
-}
-
-function sendToBridge(obj) {
-  if (!wsOpen()) return false;
-  try { socket.send(JSON.stringify(obj)); return true; }
-  catch (e) { log('发送失败', e && e.message); return false; }
-}
-function wsOpen() { return !!socket && socket.readyState === 1; } // WebSocket.OPEN === 1
-
-// ---------------- 连接管理（指数退避自动重连） ----------------
-
-function setStatus(state, detail = '') {
-  connectionState = state;
-  authDetail = detail;
-  try { if (figma.ui) figma.ui.postMessage({ type: 'status', state, detail }); }
-  catch (e) { /* UI 尚未就绪时忽略 */ }
-}
-
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connect();
-  }, reconnectDelay);
-  // 指数退避：1s 起加倍，封顶 15s（成功连接后在 onopen 里重置为 1s）
-  reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-}
-
-function connect() {
-  if (typeof WebSocket === 'undefined') {
-    setStatus('auth_failed', '当前 Figma 环境不支持 WebSocket');
-    log('当前环境无 WebSocket，无法连接桥接');
-    return;
-  }
-  if (socket && (socket.readyState === 0 || socket.readyState === 1)) return; // 已在连接/已连接
-  setStatus('connecting', BRIDGE_URL);
-  let wsConn;
-  try { wsConn = new WebSocket(BRIDGE_URL); }
-  catch (e) { log('创建 WebSocket 失败', e && e.message); scheduleReconnect(); return; }
-  socket = wsConn;
-
-  wsConn.onopen = async () => {
-    reconnectDelay = RECONNECT_MIN_MS; // 连接成功即重置退避
-    setStatus('connected', '已连接，正在鉴权…');
-    await sendAuth();
-  };
-  wsConn.onmessage = (ev) => {
-    handleIncoming(ev.data).catch((err) => log('处理消息异常', err && err.message));
-  };
-  wsConn.onerror = () => { /* 交给 onclose 统一处理 */ };
-  wsConn.onclose = () => {
-    if (socket === wsConn) socket = null;
-    setStatus('disconnected', '连接断开，正在重连…');
-    scheduleReconnect();
-  };
-}
-
-async function sendAuth() {
-  let token = '';
-  try {
-    const t = await figma.clientStorage.getAsync(AUTH_TOKEN_KEY);
-    if (typeof t === 'string') token = t;
-  } catch (e) { log('读取 clientStorage 失败', e && e.message); }
-  sendToBridge({ type: 'auth', protocol: PROTOCOL, token });
-}
-
-function handleAuthAck(msg) {
-  if (msg.ok === true) {
-    setStatus('authorized', '已授权（桥接在线）');
-  } else {
-    const detail = (msg.error && msg.error.message) ? msg.error.message : '鉴权失败';
-    setStatus('auth_failed', detail);
-  }
-}
-
-async function handlePairAck(msg) {
-  if (msg.ok === true && typeof msg.token === 'string' && msg.token.length > 0) {
-    // 配对成功：真 token 由桥接经 127.0.0.1 WS 帧签发，写入 clientStorage（不进剪贴板）
-    try { await figma.clientStorage.setAsync(AUTH_TOKEN_KEY, msg.token); }
-    catch (e) { log('保存配对 token 失败', e && e.message); }
-    setStatus('disconnected', '配对成功，正在用 token 重连…');
-    forceReconnect();
-  } else {
-    const detail = (msg.error && msg.error.message) ? msg.error.message : '配对失败';
-    setStatus('auth_failed', detail);
-    try { figma.ui.postMessage({ type: 'pairResult', ok: false, detail }); } catch (e) { /* ignore */ }
-  }
-}
-
-function forceReconnect() {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  reconnectDelay = RECONNECT_MIN_MS;
-  const old = socket;
-  socket = null;
-  if (old) { try { old.onclose = null; old.close(); } catch (e) { /* ignore */ } }
-  connect();
 }
 
 // ---------------- 启动 ----------------
 
-figma.showUI(__html__, { width: 280, height: 200 });
+figma.showUI(__html__, { width: 280, height: 230 });
+
+// 通知 UI 当前是否有已保存 token（供 UI 决定显示配对框还是直接连）
+(async () => {
+  let hasToken = false;
+  try {
+    const t = await figma.clientStorage.getAsync(AUTH_TOKEN_KEY);
+    hasToken = typeof t === 'string' && t.length > 0;
+  } catch (e) { /* ignore */ }
+  postToUi({ type: 'init', hasToken, bridgeUrl: BRIDGE_URL });
+})();
 
 figma.ui.onmessage = async (msg) => {
-  if (!msg || !isPlainObject(msg)) return;
-  if (msg.type === 'pair') {
-    // 发送 6 位配对码给桥接，换取真 token（token 不经过 UI/剪贴板）
-    const code = typeof msg.code === 'string' ? msg.code.trim() : '';
-    if (!code) { setStatus('disconnected', '配对码为空'); return; }
-    sendToBridge({ type: 'pair', code });
-  } else if (msg.type === 'queryState') {
-    try { figma.ui.postMessage({ type: 'status', state: connectionState, detail: authDetail }); }
-    catch (e) { /* ignore */ }
-    let hasToken = false;
+  if (!msg || typeof msg !== 'object') return;
+
+  // UI 转发的桥接命令：执行并回结果
+  if (msg.type === 'exec') {
+    const id = msg.id === undefined || msg.id === null ? null : msg.id;
+    if (id === null) return;
+    const params = (msg.params && typeof msg.params === 'object' && !Array.isArray(msg.params)) ? msg.params : {};
+    execAndReply(id, msg.command, params);
+    return;
+  }
+
+  // UI 要求保存配对拿到的 token
+  if (msg.type === 'saveToken') {
+    const token = typeof msg.token === 'string' ? msg.token : '';
+    try { await figma.clientStorage.setAsync(AUTH_TOKEN_KEY, token); }
+    catch (e) { postToUi({ type: 'saved', ok: false }); return; }
+    postToUi({ type: 'saved', ok: true });
+    return;
+  }
+
+  // UI 要求读取已保存 token（用于 auto-connect 鉴权）
+  if (msg.type === 'getToken') {
+    let token = '';
     try {
       const t = await figma.clientStorage.getAsync(AUTH_TOKEN_KEY);
-      hasToken = typeof t === 'string' && t.length > 0;
+      if (typeof t === 'string') token = t;
     } catch (e) { /* ignore */ }
-    try { figma.ui.postMessage({ type: 'hasToken', hasToken }); } catch (e) { /* ignore */ }
+    postToUi({ type: 'token', token });
+    return;
+  }
+
+  // UI 要求清除配对（重新配对）
+  if (msg.type === 'clearToken') {
+    try { await figma.clientStorage.deleteAsync(AUTH_TOKEN_KEY); } catch (e) { /* ignore */ }
+    postToUi({ type: 'tokenCleared' });
+    return;
   }
 };
-
-connect();

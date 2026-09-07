@@ -1,5 +1,5 @@
 <!-- figma-canvas-writer/plugin/ui.html -->
-<!-- Figma Canvas Writer —— Figma 插件连接状态面板：显示桥接状态（绿/红点）、编辑 token、保存并重连 -->
+<!-- Figma Canvas Writer —— 插件面板（iframe，有 WebSocket）：连接桥接、配对、鉴权、命令中转 -->
 <!doctype html>
 <html lang="zh-CN">
 <head>
@@ -17,9 +17,9 @@
   }
   #statusRow { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: #b3b3b3; flex: none; }
-  .dot.ok { background: #0f9d58; }     /* 绿：已授权/已连接 */
-  .dot.bad { background: #ea4335; }    /* 红：鉴权失败/断开 */
-  .dot.warn { background: #f9ab00; }   /* 黄：连接中 */
+  .dot.ok { background: #0f9d58; }
+  .dot.bad { background: #ea4335; }
+  .dot.warn { background: #f9ab00; }
   #statusText { font-weight: 600; }
   #detail { color: #777; margin-bottom: 10px; line-height: 1.4; min-height: 15px; word-break: break-all; }
   label { display: block; margin-bottom: 4px; color: #666; }
@@ -46,15 +46,30 @@
   </div>
   <div id="detail"></div>
 
-  <label for="pair">6 位配对码</label>
-  <input id="pair" type="text" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="桥接启动时 stderr 打印的 6 位数字" />
+  <div id="pairArea">
+    <label for="pair">6 位配对码</label>
+    <input id="pair" type="text" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="桥接启动时 stderr 打印的 6 位数字" />
+    <button id="pairBtn">配对并连接</button>
+  </div>
 
-  <button id="saveBtn">配对</button>
-
-  <div class="hint">配对码由桥接首次启动时打印（10 分钟有效、单次）。配对成功后真 token 自动经本机加密通道下发，无需复制。</div>
+  <div class="hint">配对码由桥接首次启动时打印（10 分钟有效、单次）。配对成功后真 token 自动经本机通道下发并保存，无需复制。</div>
 
 <script>
-  // —— 接收主线程（code.js）推送的状态 ——
+  // ============ Figma Canvas Writer UI（iframe，有 WebSocket）============
+  // 职责：建 WS 连桥接、配对/鉴权、把桥接命令转发给主线程(code.js)执行、结果回传桥接。
+  // 架构：桥接 ←WS→ 本 iframe ←postMessage→ code.js(主线程, Plugin API)
+
+  const BRIDGE_URL = 'ws://localhost:9753/plugin';
+  const PROTOCOL = 1;
+
+  let socket = null;
+  let token = '';
+  let bridgeUrl = BRIDGE_URL;
+  let reconnectDelay = 1000;
+  let reconnectTimer = null;
+  let pairPending = false;
+
+  // ---------- 状态显示 ----------
   function mapStateText(s) {
     return ({
       idle: '未启动',
@@ -65,39 +80,143 @@
       disconnected: '已断开，自动重连中…',
     }[s] || s);
   }
-
   function setState(state, detail) {
     const dot = document.getElementById('dot');
     document.getElementById('statusText').textContent = mapStateText(state);
-    // 绿点=authorized/connected；红点=auth_failed/disconnected；黄点=connecting；灰=idle
     if (state === 'authorized' || state === 'connected') dot.className = 'dot ok';
     else if (state === 'auth_failed' || state === 'disconnected') dot.className = 'dot bad';
     else if (state === 'connecting') dot.className = 'dot warn';
     else dot.className = 'dot';
     document.getElementById('detail').textContent = detail || '';
   }
+  function hidePairArea() { document.getElementById('pairArea').style.display = 'none'; }
 
-  // code.js 通过 figma.ui.postMessage 发送，落在 window message 事件的 pluginMessage 上
+  // ---------- 与主线程 code.js 通信 ----------
+  function toMain(msg) { parent.postMessage({ pluginMessage: msg }, '*'); }
+
+  // ---------- WebSocket 连接桥接 ----------
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  }
+
+  function connect() {
+    if (socket && (socket.readyState === 0 || socket.readyState === 1)) return;
+    setState('connecting', bridgeUrl);
+    let ws;
+    try { ws = new WebSocket(bridgeUrl); }
+    catch (e) { setState('disconnected', '无法创建 WebSocket: ' + (e && e.message)); scheduleReconnect(); return; }
+    socket = ws;
+
+    ws.onopen = () => {
+      reconnectDelay = 1000;
+      setState('connected', '已连接，正在鉴权…');
+      // 已有 token → 直接鉴权；否则若在配对中 → 发配对码
+      if (token) {
+        ws.send(JSON.stringify({ type: 'auth', protocol: PROTOCOL, token }));
+      } else if (pairPending) {
+        const code = document.getElementById('pair').value.trim();
+        ws.send(JSON.stringify({ type: 'pair', code }));
+      }
+    };
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(String(ev.data)); } catch (e) { return; }
+      if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'pair_ack') {
+        if (msg.ok === true && typeof msg.token === 'string' && msg.token.length > 0) {
+          token = msg.token;
+          pairPending = false;
+          toMain({ type: 'saveToken', token }); // 持久化到主线程 clientStorage
+          setState('connected', '配对成功，正在鉴权…');
+          ws.send(JSON.stringify({ type: 'auth', protocol: PROTOCOL, token }));
+        } else {
+          pairPending = false;
+          setState('auth_failed', (msg.error && msg.error.message) || '配对失败');
+        }
+        return;
+      }
+
+      if (msg.type === 'auth_ack') {
+        if (msg.ok === true) { setState('authorized', '已授权（桥接在线）'); hidePairArea(); }
+        else setState('auth_failed', (msg.error && msg.error.message) || '鉴权失败');
+        return;
+      }
+
+      // 桥接命令 → 转发主线程执行
+      if (msg.type === 'cmd') {
+        toMain({ type: 'exec', id: msg.id, command: msg.command, params: msg.params });
+        return;
+      }
+    };
+
+    ws.onerror = () => { /* 交给 onclose */ };
+    ws.onclose = () => {
+      if (socket === ws) socket = null;
+      setState('disconnected', '连接断开，正在重连…');
+      scheduleReconnect();
+    };
+  }
+
+  // ---------- 主线程结果回传桥接 ----------
   window.onmessage = (event) => {
     const msg = event.data && event.data.pluginMessage;
     if (!msg) return;
-    if (msg.type === 'status') setState(msg.state, msg.detail);
-    else if (msg.type === 'pairResult' && msg.ok === false) {
-      setState('auth_failed', msg.detail || '配对失败');
+
+    // code.js 执行结果 → 经 WS 回桥接
+    if (msg.type === 'exec_result') {
+      if (socket && socket.readyState === 1) {
+        const payload = msg.ok
+          ? { type: 'resp', id: msg.id, ok: true, data: msg.data }
+          : { type: 'resp', id: msg.id, ok: false, error: msg.error };
+        try { socket.send(JSON.stringify(payload)); } catch (e) { /* ignore */ }
+      }
+      return;
+    }
+
+    // code.js 启动时报告初始化状态（含是否已有 token）
+    if (msg.type === 'init') {
+      bridgeUrl = msg.bridgeUrl || BRIDGE_URL;
+      if (msg.hasToken) hidePairArea();
+      return;
+    }
+
+    // code.js 报告 token 读取结果（启动时）
+    if (msg.type === 'token') {
+      token = msg.token || '';
+      if (token) hidePairArea();
+      connect();
+      return;
+    }
+    if (msg.type === 'tokenCleared') {
+      token = '';
+      document.getElementById('pairArea').style.display = '';
+      return;
+    }
+    if (msg.type === 'saved') {
+      // token 已持久化, 无需动作
+      return;
     }
   };
 
-  // —— 发送 6 位配对码换取 token ——
-  document.getElementById('saveBtn').addEventListener('click', () => {
+  // ---------- 配对按钮 ----------
+  document.getElementById('pairBtn').addEventListener('click', () => {
     const code = document.getElementById('pair').value.trim();
     if (!/^\d{6}$/.test(code)) { setState('auth_failed', '配对码必须是 6 位数字'); return; }
-    parent.postMessage({ pluginMessage: { type: 'pair', code } }, '*');
+    pairPending = true;
+    if (socket && socket.readyState === 1) {
+      socket.send(JSON.stringify({ type: 'pair', code }));
+    } else {
+      connect(); // 未连接则先连, onopen 里会发 pair
+    }
     setState('connecting', '配对中…');
-    document.getElementById('pair').value = '';
   });
 
-  // 面板打开时向主线程查询一次当前状态
-  parent.postMessage({ pluginMessage: { type: 'queryState' } }, '*');
+  // ---------- 启动：向主线程要已保存的 token，然后连接 ----------
+  toMain({ type: 'getToken' });
 </script>
 </body>
 </html>
