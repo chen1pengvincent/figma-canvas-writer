@@ -16,7 +16,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 // ---------------- 常量 ----------------
 
-const HOST = '127.0.0.1';       // 只绑本机回环，不对外暴露
+const HOST = '::';       // 绑双栈(IPv4+IPv6), 让 localhost 无论解析到 127.0.0.1 还是 ::1 都能连; 安全性由 connection 处的回环白名单校验保证
 const PORT = Number(process.env.FIGMA_BRIDGE_PORT || 9753);  // 可用环境变量覆盖(多 agent 隔离)
 const WS_PATH = '/plugin';      // 插件连接路径
 const PROTOCOL = 1;             // 与插件约定的鉴权协议版本
@@ -258,7 +258,14 @@ function handleResp(client, msg) {
 
 function startWsServer() {
   wss.on('connection', (client, req) => {
+    // 回环白名单校验（绑定双栈 :: 后必须校验，只放行本机回环，拒绝局域网/远程）
     client.remoteAddress = req.socket ? req.socket.remoteAddress : 'unknown';
+    const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+    if (!LOOPBACK.has(client.remoteAddress)) {
+      log(`拒绝非回环连接: ${client.remoteAddress}`);
+      try { client.close(4000, 'localhost only'); } catch (e) { /* ignore */ }
+      return;
+    }
     client.authed = false;
     client.lastSeen = null;
     client.isAlive = true; // 心跳存活标记: 每轮 ping 前置 false, 收到 pong 置回 true
