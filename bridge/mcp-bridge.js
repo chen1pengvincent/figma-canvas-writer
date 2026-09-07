@@ -37,7 +37,7 @@ const AUDIT_FILE = path.join(CONFIG_DIR, 'audit.log');
 const COMMAND_WHITELIST = new Set([
   'ping', 'getSelection', 'getNodeInfo', 'createNode', 'modifyNode', 'deleteNode', 'setText',
 ]);
-const CREATE_TYPES = ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE'];
+const CREATE_TYPES = ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE', 'STAR'];
 const MODIFY_PROPS = new Set([
   'name', 'x', 'y', 'width', 'height', 'rotation',
   'opacity', 'visible', 'fills', 'strokes', 'strokeWeight', 'cornerRadius',

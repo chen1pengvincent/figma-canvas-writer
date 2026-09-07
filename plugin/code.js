@@ -12,7 +12,7 @@ const RECONNECT_MAX_MS = 15000;                  // 指数退避上限 15s
 // ---- 白名单（安全边界）----
 // 原因：所有命令与属性一律在白名单内分发/修改，未收录的键直接拒绝，
 // 防止通过命令名或属性名注入、访问画布之外的 API。
-const CREATE_TYPES = ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE'];
+const CREATE_TYPES = ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE', 'STAR'];
 const MODIFY_PROPS = new Set([
   'name', 'x', 'y', 'width', 'height', 'rotation',
   'opacity', 'visible', 'fills', 'strokes', 'strokeWeight', 'cornerRadius',
@@ -293,6 +293,8 @@ async function handleCreateNode(p) {
       node = figma.createLine();
       node.strokeWeight = 1;
       node.strokes = [{ type: 'SOLID', color: { r: 0, g: 0, b: 0, a: 1 } }];
+    } else if (type === 'STAR') {
+      node = figma.createStar(); // Figma Plugin API 原生星形
     }
     if (!node) throw appErr('CREATE_FAILED', '节点创建失败');
     if (name !== undefined) node.name = name;
