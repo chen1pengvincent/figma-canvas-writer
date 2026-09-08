@@ -321,7 +321,7 @@ const R = {
     description: '本地变量集合、变量、模式、值、别名与节点绑定；循环/类型冲突返回真实错误。',
     inputSchema: object({
       ...TARGET, nodeId: idStr(),
-      action: { type: 'string', enum: ['listCollections', 'listVariables', 'getVariable', 'createVariable', 'renameVariable', 'deleteVariable',
+      action: { type: 'string', enum: ['listCollections', 'listVariables', 'getVariable', 'createCollection', 'createVariable', 'renameVariable', 'deleteVariable',
         'setValue', 'createMode', 'renameMode', 'deleteMode', 'resolveValue', 'setBoundVariable'] },
       collectionId: idStr(), variableId: idStr(), modeId: idStr(), field: str(64),
       name: str0(512), resolvedType: { type: 'string', enum: ['BOOLEAN', 'FLOAT', 'COLOR', 'STRING'] },
@@ -385,7 +385,7 @@ const R = {
       action: { type: 'string', enum: ['set', 'clear'] },
       reactions: array(object({
         trigger: object({ type: { type: 'string', enum: ['ON_CLICK', 'ON_HOVER', 'ON_PRESS', 'ON_DRAG', 'AFTER_TIMEOUT', 'MOUSE_ENTER', 'MOUSE_LEAVE', 'MOUSE_UP', 'MOUSE_DOWN'] }, timeout: number(0, 1e6) }, ['type']),
-        action: object({ type: { type: 'string', enum: ['BACK', 'CLOSE', 'LINK', 'NAVIGATE', 'NODE', 'OPEN_LINK', 'SET_VARIABLE', 'UPDATE_MEDIA_RUNTIME', 'URL'] }, destinationId: idStr(), navigation: { type: 'string', enum: ['NAVIGATE', 'SWAP', 'OVERLAY'] }, transition: object({ type: { type: 'string', enum: ['MOVE_IN', 'MOVE_OUT', 'PUSH', 'SLIDE_IN', 'SLIDE_OUT', 'DISSOLVE', 'SMART_ANIMATE', 'SCROLL_ANIMATE'] }, duration: number(0, 10000), easing: object({ type: { type: 'string', enum: ['EASE_IN', 'EASE_OUT', 'EASE_IN_AND_OUT', 'LINEAR'] } }, ['type']) }), url: str(4096), preserveScrollPosition: bool, overlayRelativePosition: object({ x: number(-1e6, 1e6), y: number(-1e6, 1e6) }, ['x', 'y']) }, ['type']),
+        action: object({ type: { type: 'string', enum: ['BACK', 'CLOSE', 'URL', 'OPEN_LINK', 'UPDATE_MEDIA_RUNTIME', 'SET_VARIABLE', 'SET_VARIABLE_MODE', 'CONDITIONAL', 'NODE'] }, destinationId: { anyOf: [idStr(), { type: 'null' }] }, navigation: { type: 'string', enum: ['NAVIGATE', 'SWAP', 'OVERLAY', 'SCROLL_TO', 'CHANGE_TO'] }, transition: { anyOf: [object({ type: { type: 'string', enum: ['MOVE_IN', 'MOVE_OUT', 'PUSH', 'SLIDE_IN', 'SLIDE_OUT', 'DISSOLVE', 'SMART_ANIMATE', 'SCROLL_ANIMATE'] }, duration: number(0, 10000), easing: object({ type: { type: 'string', enum: ['EASE_IN', 'EASE_OUT', 'EASE_IN_AND_OUT', 'LINEAR'] } }, ['type']) }, ['type']), { type: 'null' }] }, mediaAction: str(64), variableId: { anyOf: [idStr(), { type: 'null' }] }, variableCollectionId: { anyOf: [idStr(), { type: 'null' }] }, variableModeId: { anyOf: [idStr(), { type: 'null' }] }, conditionalBlocks: array(object({}, [], true), { maxItems: 16 }), url: str(4096), preserveScrollPosition: bool, overlayRelativePosition: object({ x: number(-1e6, 1e6), y: number(-1e6, 1e6) }, ['x', 'y']) }, ['type']),
       }, ['trigger', 'action']), { maxItems: 64 }),
       prototypeStartNodeId: { anyOf: [idStr(), { type: 'null' }] },
     }, [...TARGET_REQUIRED, 'operationId', 'nodeId', 'action']),
@@ -451,7 +451,7 @@ const R = {
     inputSchema: object({
       ...TARGET, nodeId: idStr(), slideId: idStr(), rowId: idStr(),
       action: { type: 'string', enum: ['listStructure', 'createSlide', 'createSlideRow', 'addContent', 'updateContent'] },
-      content: object({ type: { type: 'string', enum: ['FRAME', 'RECTANGLE', 'ELLIPSE', 'TEXT', 'LINE'] }, x: number(-1e6, 1e6), y: number(-1e6, 1e6), width: number(1, 1e5), height: number(1, 1e5), text: str0(200000), name: str0(10000), fontSize: number(1, 1000), fills: paints }, ['type']),
+      content: object({ type: { type: 'string', enum: ['FRAME', 'RECTANGLE', 'ELLIPSE', 'TEXT', 'LINE'] }, x: number(-1e6, 1e6), y: number(-1e6, 1e6), width: number(1, 1e5), height: number(1, 1e5), text: str0(200000), name: str0(10000), fontSize: number(1, 1000), fills: paints }),
       order: { type: 'string', enum: ['start', 'end', 'before', 'after'] }, relativeToId: idStr(),
     }, [...TARGET_REQUIRED, 'action']),
   },
@@ -461,7 +461,7 @@ const R = {
 // Mutating actions of mixed tools; used to require operationId conditionally
 // via if/then on both the MCP schema and the runtime write classification.
 export const WRITE_ACTIONS_BY_COMMAND = {
-  variables: ['createVariable', 'renameVariable', 'deleteVariable', 'setValue', 'createMode', 'renameMode', 'deleteMode', 'setBoundVariable'],
+  variables: ['createCollection', 'createVariable', 'renameVariable', 'deleteVariable', 'setValue', 'createMode', 'renameMode', 'deleteMode', 'setBoundVariable'],
   styles: ['create', 'update', 'apply', 'delete'],
   components: ['createFromNode', 'createInstance', 'combineAsVariants', 'swap', 'detach', 'setInstanceProperty', 'addComponentProperty', 'editComponentProperty', 'deleteComponentProperty'],
   libraries: ['importVariable', 'importComponent', 'importStyle'],

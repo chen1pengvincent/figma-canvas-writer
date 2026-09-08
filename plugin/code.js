@@ -492,6 +492,7 @@
           "listCollections",
           "listVariables",
           "getVariable",
+          "createCollection",
           "createVariable",
           "renameVariable",
           "deleteVariable",
@@ -609,7 +610,7 @@
         action: { type: "string", enum: ["set", "clear"] },
         reactions: array(object({
           trigger: object({ type: { type: "string", enum: ["ON_CLICK", "ON_HOVER", "ON_PRESS", "ON_DRAG", "AFTER_TIMEOUT", "MOUSE_ENTER", "MOUSE_LEAVE", "MOUSE_UP", "MOUSE_DOWN"] }, timeout: number(0, 1e6) }, ["type"]),
-          action: object({ type: { type: "string", enum: ["BACK", "CLOSE", "LINK", "NAVIGATE", "NODE", "OPEN_LINK", "SET_VARIABLE", "UPDATE_MEDIA_RUNTIME", "URL"] }, destinationId: idStr(), navigation: { type: "string", enum: ["NAVIGATE", "SWAP", "OVERLAY"] }, transition: object({ type: { type: "string", enum: ["MOVE_IN", "MOVE_OUT", "PUSH", "SLIDE_IN", "SLIDE_OUT", "DISSOLVE", "SMART_ANIMATE", "SCROLL_ANIMATE"] }, duration: number(0, 1e4), easing: object({ type: { type: "string", enum: ["EASE_IN", "EASE_OUT", "EASE_IN_AND_OUT", "LINEAR"] } }, ["type"]) }), url: str(4096), preserveScrollPosition: bool, overlayRelativePosition: object({ x: number(-1e6, 1e6), y: number(-1e6, 1e6) }, ["x", "y"]) }, ["type"])
+          action: object({ type: { type: "string", enum: ["BACK", "CLOSE", "URL", "OPEN_LINK", "UPDATE_MEDIA_RUNTIME", "SET_VARIABLE", "SET_VARIABLE_MODE", "CONDITIONAL", "NODE"] }, destinationId: { anyOf: [idStr(), { type: "null" }] }, navigation: { type: "string", enum: ["NAVIGATE", "SWAP", "OVERLAY", "SCROLL_TO", "CHANGE_TO"] }, transition: { anyOf: [object({ type: { type: "string", enum: ["MOVE_IN", "MOVE_OUT", "PUSH", "SLIDE_IN", "SLIDE_OUT", "DISSOLVE", "SMART_ANIMATE", "SCROLL_ANIMATE"] }, duration: number(0, 1e4), easing: object({ type: { type: "string", enum: ["EASE_IN", "EASE_OUT", "EASE_IN_AND_OUT", "LINEAR"] } }, ["type"]) }, ["type"]), { type: "null" }] }, mediaAction: str(64), variableId: { anyOf: [idStr(), { type: "null" }] }, variableCollectionId: { anyOf: [idStr(), { type: "null" }] }, variableModeId: { anyOf: [idStr(), { type: "null" }] }, conditionalBlocks: array(object({}, [], true), { maxItems: 16 }), url: str(4096), preserveScrollPosition: bool, overlayRelativePosition: object({ x: number(-1e6, 1e6), y: number(-1e6, 1e6) }, ["x", "y"]) }, ["type"])
         }, ["trigger", "action"]), { maxItems: 64 }),
         prototypeStartNodeId: { anyOf: [idStr(), { type: "null" }] }
       }, [...TARGET_REQUIRED, "operationId", "nodeId", "action"])
@@ -712,14 +713,14 @@
         slideId: idStr(),
         rowId: idStr(),
         action: { type: "string", enum: ["listStructure", "createSlide", "createSlideRow", "addContent", "updateContent"] },
-        content: object({ type: { type: "string", enum: ["FRAME", "RECTANGLE", "ELLIPSE", "TEXT", "LINE"] }, x: number(-1e6, 1e6), y: number(-1e6, 1e6), width: number(1, 1e5), height: number(1, 1e5), text: str0(2e5), name: str0(1e4), fontSize: number(1, 1e3), fills: paints }, ["type"]),
+        content: object({ type: { type: "string", enum: ["FRAME", "RECTANGLE", "ELLIPSE", "TEXT", "LINE"] }, x: number(-1e6, 1e6), y: number(-1e6, 1e6), width: number(1, 1e5), height: number(1, 1e5), text: str0(2e5), name: str0(1e4), fontSize: number(1, 1e3), fills: paints }),
         order: { type: "string", enum: ["start", "end", "before", "after"] },
         relativeToId: idStr()
       }, [...TARGET_REQUIRED, "action"])
     }
   };
   var WRITE_ACTIONS_BY_COMMAND = {
-    variables: ["createVariable", "renameVariable", "deleteVariable", "setValue", "createMode", "renameMode", "deleteMode", "setBoundVariable"],
+    variables: ["createCollection", "createVariable", "renameVariable", "deleteVariable", "setValue", "createMode", "renameMode", "deleteMode", "setBoundVariable"],
     styles: ["create", "update", "apply", "delete"],
     components: ["createFromNode", "createInstance", "combineAsVariants", "swap", "detach", "setInstanceProperty", "addComponentProperty", "editComponentProperty", "deleteComponentProperty"],
     libraries: ["importVariable", "importComponent", "importStyle"],
@@ -1535,7 +1536,7 @@
           id: page.id,
           name: String(page.name).slice(0, 1024),
           isCurrent: page.id === figma.currentPage.id,
-          childCount: (page.children || []).length
+          childCount: page.id === figma.currentPage.id ? page.children.length : null
         }))
       };
     },
@@ -1571,6 +1572,7 @@
         const targetPageId = page.id;
         await figma.setCurrentPageAsync(page);
         assertAuthGeneration(t);
+        bumpPageRevision();
         return { ...getContext(), switched: true, sourcePageId, targetPageId };
       }
       throw appErr("INVALID_PARAM", "\u672A\u77E5\u9875\u9762\u52A8\u4F5C");
@@ -2673,7 +2675,7 @@
     };
   }
   async function handleImportAsset(p, t) {
-    onlyKeys(p, ["format", "fileName", "totalBytes", "totalSha256", "assetBase64", "x", "y", "parentId", "name"]);
+    onlyKeys(p, ["format", "fileName", "totalBytes", "totalSha256", "assetBase64", "x", "y", "parentId", "name", "transferId"]);
     const format = requireStr(p.format, "format").toUpperCase();
     if (p.assetBase64 === void 0) throw appErr("INVALID_ASSET", "\u8D44\u6E90\u672A\u4F20\u8F93\u5B8C\u6574");
     const bytes = base64ToBytes(p.assetBase64);
@@ -2739,7 +2741,8 @@
         } catch {
         }
       }
-      throw appErr("IMPORT_FAILED", "\u5BFC\u5165\u5931\u8D25: " + (e && e.message ? e.message : String(e)));
+      const detail = e instanceof Error ? e.message || String(e) : JSON.stringify(e);
+      throw appErr("IMPORT_FAILED", "\u5BFC\u5165\u5931\u8D25: " + detail);
     }
   }
   async function startVideoJob(p, t) {
@@ -4084,6 +4087,20 @@
       }
       case "getVariable":
         return variableInfo(await fetchVariable(p.variableId, t));
+      case "createCollection": {
+        onlyKeys(p, ["action", "name"]);
+        requireStr(p.name, "name");
+        assertTarget(t);
+        if (typeof figma.variables?.createVariableCollection !== "function") throw appErr("UNSUPPORTED", "figma.variables.createVariableCollection \u4E0D\u53EF\u7528");
+        markMutation(t);
+        const collection = figma.variables.createVariableCollection(p.name);
+        return {
+          collectionId: collection.id,
+          name: collection.name,
+          modes: collection.modes.map((mode) => ({ modeId: mode.modeId, name: mode.name })),
+          variableIds: []
+        };
+      }
       case "createVariable": {
         requireStr(p.name, "name");
         requireStr(p.collectionId, "collectionId");
@@ -4680,13 +4697,13 @@
   var ACTION_TYPES = /* @__PURE__ */ new Set([
     "BACK",
     "CLOSE",
-    "LINK",
-    "NAVIGATE",
-    "NODE",
+    "URL",
     "OPEN_LINK",
-    "SET_VARIABLE",
     "UPDATE_MEDIA_RUNTIME",
-    "URL"
+    "SET_VARIABLE",
+    "SET_VARIABLE_MODE",
+    "CONDITIONAL",
+    "NODE"
   ]);
   var ACTION_KEYS = [
     "destinationId",
@@ -4762,8 +4779,10 @@
     markMutation(t, node);
     if (touchesStartNode && startNode) markMutation(t, startNode);
     try {
-      if (typeof node.setReactionsAsync === "function") await node.setReactionsAsync(reactions);
-      else node.reactions = reactions;
+      if (typeof node.setReactionsAsync === "function") {
+        const apiReactions = reactions.map((reaction) => ({ trigger: reaction.trigger, actions: [reaction.action] }));
+        await node.setReactionsAsync(apiReactions);
+      } else node.reactions = reactions;
       if (touchesStartNode) figma.currentPage.prototypeStartNode = startNode;
     } catch (e) {
       if (e && e.code) throw e;
@@ -5361,38 +5380,46 @@
   async function listStructure(p, t) {
     onlyKeys(p, ["action"]);
     assertTarget(t);
-    const children = figma.root.children || [];
-    const structure = children.slice(0, STRUCTURE_LIMIT).map((node) => {
+    const structure = [];
+    const visit = (node, depth) => {
+      if (!node || structure.length >= STRUCTURE_LIMIT || depth > 3) return;
       const item = { id: node.id, type: node.type };
       if (node.name !== void 0) item.name = String(node.name).slice(0, NAME_MAX2);
-      if (Array.isArray(node.children)) item.childCount = node.children.length;
-      return item;
-    });
-    return { structure, total: children.length, truncated: children.length > structure.length };
+      if (Array.isArray(node.children)) {
+        item.childCount = node.children.length;
+        structure.push(item);
+        for (const child of node.children) visit(child, depth + 1);
+      } else {
+        structure.push(item);
+      }
+    };
+    visit(figma.currentPage, 0);
+    return { structure, total: structure.length, truncated: false };
   }
-  async function createSlideNode(p, t, creator) {
+  async function createSlideNode(p, t, nodeType) {
     onlyKeys(p, ["action", "order", "relativeToId"]);
-    let insertIndex = null;
-    if (p.order === "start") insertIndex = 0;
-    if (p.order === "before" || p.order === "after") {
-      if (p.relativeToId === void 0) {
-        throw appErr("INVALID_PARAM", "order \u4E3A before/after \u65F6\u5FC5\u987B\u63D0\u4F9B relativeToId");
-      }
-      const sibling = await findDeckNode(p.relativeToId, t);
-      if (sibling.type !== "SLIDE" && sibling.type !== "SLIDE_ROW") {
-        throw appErr("INVALID_TARGET", "relativeToId \u5FC5\u987B\u662F\u5E7B\u706F\u7247\u6216\u5E7B\u706F\u7247\u884C");
-      }
-      const index = figma.root.children.indexOf(sibling);
-      if (index === -1) throw appErr("INVALID_TARGET", "relativeToId \u5FC5\u987B\u662F\u6839\u5C42\u7EA7\u7684\u5E7B\u706F\u7247\u6216\u5E7B\u706F\u7247\u884C");
-      insertIndex = p.order === "before" ? index : index + 1;
+    if (p.order !== void 0 && p.order !== "end") {
+      throw appErr("UNSUPPORTED", '\u5F53\u524D\u7248\u672C\u4EC5\u652F\u6301 order: "end"\uFF08\u8FFD\u52A0\u5230\u6F14\u793A\u6587\u7A3F\u672B\u5C3E\uFF09');
     }
     assertTarget(t);
     markMutation(t);
-    const node = creator();
+    let node;
+    if (nodeType === "SLIDE") {
+      try {
+        node = figma.createSlide();
+      } catch (bareError) {
+        const message = String(bareError?.message || bareError);
+        if (message.includes("SLIDE")) {
+          throw appErr("EDITOR_LIMITATION", `\u5F53\u524D Figma \u7248\u672C\u7684 createSlide \u53D7\u9650: ${message}`);
+        }
+        throw bareError;
+      }
+    } else {
+      node = figma.createSlideRow();
+    }
     t.affected.push(node.id);
     try {
-      if (insertIndex === null) figma.root.appendChild(node);
-      else figma.root.insertChild(insertIndex, node);
+      if (!node.parent || node.removed) throw appErr("PLUGIN_ERROR", "\u521B\u5EFA\u540E\u672A\u843D\u5165\u6F14\u793A\u6587\u7A3F\u7ED3\u6784");
     } catch (e) {
       rollbackCreation2(e, node, t);
       throw e;
@@ -5400,12 +5427,10 @@
     return buildNodeInfo(node);
   }
   async function createSlide(p, t) {
-    return createSlideNode(p, t, () => figma.createSlide());
-  }
-  async function createSlideRow(p, t) {
-    return createSlideNode(p, t, () => figma.createSlideRow());
+    return createSlideNode(p, t, "SLIDE");
   }
   async function addContent(p, t) {
+    if (!isPlainObject2(p.content) || typeof p.content.type !== "string") throw appErr("INVALID_PARAM", "addContent \u9700\u8981 content.type");
     onlyKeys(p, ["action", "slideId", "content"]);
     requireStr(p.slideId, "slideId");
     const content = p.content;
@@ -5517,6 +5542,9 @@
       throw e;
     }
     return buildNodeInfo(node);
+  }
+  async function createSlideRow(p, t) {
+    return createSlideNode(p, t, "SLIDE_ROW");
   }
   async function handleSlides(p, t) {
     assertSlides();
@@ -5631,6 +5659,9 @@
     const source = override || tool.inputSchema;
     const schema = JSON.parse(JSON.stringify(source));
     for (const key of ["sessionId", "pageId", "pageRevision", "operationId"]) delete schema.properties[key];
+    if (["getScreenshot", "exportAsset", "importAsset"].includes(command)) {
+      schema.properties.transferId = { type: "string", maxLength: 64 };
+    }
     if (Object.prototype.hasOwnProperty.call(schema.properties, "nodeId")) {
       schema.properties.id = schema.properties.nodeId;
       delete schema.properties.nodeId;

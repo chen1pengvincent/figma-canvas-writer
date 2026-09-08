@@ -190,6 +190,16 @@ async function handleVariables(p, t) {
     }
     case 'getVariable':
       return variableInfo(await fetchVariable(p.variableId, t));
+    case 'createCollection': {
+      onlyKeys(p, ['action', 'name']);
+      requireStr(p.name, 'name');
+      assertTarget(t);
+      if (typeof figma.variables?.createVariableCollection !== 'function') throw appErr('UNSUPPORTED', 'figma.variables.createVariableCollection 不可用');
+      markMutation(t);
+      const collection = figma.variables.createVariableCollection(p.name);
+      return { collectionId: collection.id, name: collection.name,
+        modes: collection.modes.map(mode => ({ modeId: mode.modeId, name: mode.name })), variableIds: [] };
+    }
     case 'createVariable': {
       requireStr(p.name, 'name');
       requireStr(p.collectionId, 'collectionId');

@@ -13,7 +13,7 @@ function attachSlideContainer(slide) {
   return slide;
 }
 
-function rootChildrenOfType(plugin, type) {
+function pageChildrenOfType(plugin, type) {
   return plugin.root.children.filter((node) => node.type === type);
 }
 
@@ -278,65 +278,48 @@ test('listNodes filters FigJam node types, paginates and truncates long text rea
 
 // ---- figma_slides ------------------------------------------------------------
 
-test('listStructure summarizes the deck root without touching it', async () => {
+test('listStructure descends page -> grid/rows/slides without touching it', async () => {
   const plugin = await makePlugin({ editorType: 'slides' });
   const data = success(await plugin.send('slides', { action: 'listStructure' }));
-  assert.equal(data.total, 2);
   assert.equal(data.truncated, false);
-  assert.deepEqual(data.structure, [
-    { id: plugin.pageA.id, type: 'PAGE', name: 'Page A', childCount: 0 },
-    { id: plugin.pageB.id, type: 'PAGE', name: 'Page B', childCount: 0 },
-  ]);
+  assert.equal(data.structure[0].id, plugin.pageA.id);
+  assert.equal(data.structure[0].type, 'PAGE');
   const mutationsBefore = plugin.mutations.length;
   success(await plugin.send('slides', { action: 'listStructure' }));
   assert.equal(plugin.mutations.length, mutationsBefore);
 });
 
-test('createSlide supports end/start/before/after ordering in the deck root', async () => {
+test('createSlide uses documented auto-placement; only order end is supported', async () => {
   const plugin = await makePlugin({ editorType: 'slides' });
   const first = success(await plugin.send('slides', { action: 'createSlide' }));
   assert.equal(first.type, 'SLIDE');
-  assert.equal(first.parentId, plugin.root.id);
   const second = success(await plugin.send('slides', { action: 'createSlide', order: 'end' }));
-  const third = success(await plugin.send('slides', { action: 'createSlide', order: 'start' }));
-  assert.equal(rootChildrenOfType(plugin, 'SLIDE').length, 3);
-  assert.equal(plugin.root.children[0].id, third.id);
-  assert.equal(plugin.root.children.at(-1).id, second.id);
+  assert.equal(second.type, 'SLIDE');
+  assert.equal(plugin.pageA.children.filter((node) => node.type === 'SLIDE').length, 2);
+  assert.ok(second.affectedNodeIds.includes(second.id));
+  assert.ok(plugin.mutations.some((m) => m.nodeId === second.id && m.prop === 'create'));
 
-  const fourth = success(await plugin.send('slides', { action: 'createSlide', order: 'before', relativeToId: second.id }));
-  let index = plugin.root.children.findIndex((node) => node.id === second.id);
-  assert.equal(plugin.root.children[index - 1].id, fourth.id);
-  const fifth = success(await plugin.send('slides', { action: 'createSlide', order: 'after', relativeToId: second.id }));
-  index = plugin.root.children.findIndex((node) => node.id === second.id);
-  assert.equal(plugin.root.children[index + 1].id, fifth.id);
-  assert.ok(fourth.affectedNodeIds.includes(fourth.id));
-  assert.ok(plugin.mutations.some((m) => m.nodeId === fourth.id && m.prop === 'parent'));
-
+  const unsupported = failure(await plugin.send('slides', { action: 'createSlide', order: 'before', relativeToId: first.id }));
+  assert.equal(unsupported.code, 'UNSUPPORTED');
   const missingRelative = failure(await plugin.send('slides', { action: 'createSlide', order: 'before' }));
-  assert.equal(missingRelative.code, 'INVALID_PARAM');
-  const notFound = failure(await plugin.send('slides', { action: 'createSlide', order: 'after', relativeToId: '9:9' }));
-  assert.equal(notFound.code, 'NODE_NOT_FOUND');
-  const notSlide = failure(await plugin.send('slides', { action: 'createSlide', order: 'before', relativeToId: plugin.pageB.id }));
-  assert.equal(notSlide.code, 'INVALID_TARGET');
+  assert.equal(missingRelative.code, 'UNSUPPORTED');
 });
 
-test('createSlideRow appends a slide row that shows up in listStructure', async () => {
+test('createSlideRow auto-places into the deck and shows up in listStructure', async () => {
   const plugin = await makePlugin({ editorType: 'slides' });
   const data = success(await plugin.send('slides', { action: 'createSlideRow' }));
   assert.equal(data.type, 'SLIDE_ROW');
-  const row = rootChildrenOfType(plugin, 'SLIDE_ROW')[0];
+  const row = plugin.pageA.children.find((node) => node.type === 'SLIDE_ROW');
   assert.ok(row);
   assert.equal(data.id, row.id);
-  assert.equal(data.parentId, plugin.root.id);
   const structure = success(await plugin.send('slides', { action: 'listStructure' }));
-  assert.equal(structure.total, 3);
   assert.ok(structure.structure.some((item) => item.id === row.id && item.type === 'SLIDE_ROW'));
 });
 
 test('addContent creates content on the slide with props and fills applied', async () => {
   const plugin = await makePlugin({ editorType: 'slides' });
   const slideData = success(await plugin.send('slides', { action: 'createSlide' }));
-  const slide = attachSlideContainer(plugin.root.children.find((node) => node.id === slideData.id));
+  const slide = attachSlideContainer(plugin.pageA.children.find((node) => node.id === slideData.id));
   const data = success(await plugin.send('slides', {
     action: 'addContent', slideId: slide.id,
     content: { type: 'RECTANGLE', x: 5, y: 6, width: 80, height: 40, name: '方块', fills: [{ type: 'SOLID', color: '#FF0000' }] },
@@ -357,7 +340,7 @@ test('addContent creates content on the slide with props and fills applied', asy
 test('addContent writes TEXT through the loaded font and leaves no residue on font failure', async () => {
   const plugin = await makePlugin({ editorType: 'slides' });
   const slideData = success(await plugin.send('slides', { action: 'createSlide' }));
-  const slide = attachSlideContainer(plugin.root.children.find((node) => node.id === slideData.id));
+  const slide = attachSlideContainer(plugin.pageA.children.find((node) => node.id === slideData.id));
   const data = success(await plugin.send('slides', {
     action: 'addContent', slideId: slide.id,
     content: { type: 'TEXT', x: 0, y: 0, width: 200, height: 40, text: '标题', fontSize: 24 },
@@ -397,7 +380,7 @@ test('addContent validates the slide target and rolls back when the container ca
   assert.equal(badContent.code, 'INVALID_PARAM');
 
   const slideData = success(await plugin.send('slides', { action: 'createSlide' }));
-  const slide = plugin.root.children.find((node) => node.id === slideData.id);
+  const slide = plugin.pageA.children.find((node) => node.id === slideData.id);
   const pageChildrenBefore = plugin.pageA.children.length;
   // Simulate an editor that refuses to host content nodes on the slide.
   const savedAppend = slide.appendChild;
@@ -418,7 +401,7 @@ test('addContent validates the slide target and rolls back when the container ca
 test('updateContent applies a property subset, loads fonts for text and rejects unsupported props', async () => {
   const plugin = await makePlugin({ editorType: 'slides' });
   const slideData = success(await plugin.send('slides', { action: 'createSlide' }));
-  const slide = attachSlideContainer(plugin.root.children.find((node) => node.id === slideData.id));
+  const slide = attachSlideContainer(plugin.pageA.children.find((node) => node.id === slideData.id));
   const rect = success(await plugin.send('slides', {
     action: 'addContent', slideId: slide.id,
     content: { type: 'RECTANGLE', x: 1, y: 2, width: 50, height: 60, name: '原名' },

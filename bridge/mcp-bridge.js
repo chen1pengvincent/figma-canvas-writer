@@ -427,9 +427,17 @@ wss.on('connection', client => {
         const context = normalizeContext(msg.context);
         if (!verify(bridgeKey, authProof('client-auth', client.serverNonce, msg.clientNonce, context), msg.proof)) throw error('AUTH_FAILED', '鉴权失败');
         if (active && active !== client) {
-          sendPlain(client, { type: 'auth_ack', ok: false, error: { code: 'PLUGIN_BUSY', message: '另一个插件已获授权，请先断开该插件' } });
-          drop(client, 'PLUGIN_BUSY', '已有插件连接');
-          return;
+          // Page switches make the UI reconnect while the old socket is still
+          // mid-close; accept the replacement when the old client is going
+          // away, but keep the takeover protection for a live connection.
+          const stale = active.readyState === WebSocket.CLOSING || active.readyState === WebSocket.CLOSED ||
+            (Date.now() - (active.lastSeen || 0) > 3000);
+          if (!stale) {
+            sendPlain(client, { type: 'auth_ack', ok: false, error: { code: 'PLUGIN_BUSY', message: '另一个插件已获授权，请先断开该插件' } });
+            drop(client, 'PLUGIN_BUSY', '已有插件连接');
+            return;
+          }
+          drop(active, 'PLUGIN_REPLACED', '插件已用新连接替换旧连接');
         }
         client.context = context;
         client.connectionId = randomBytes(32).toString('hex');
@@ -622,7 +630,10 @@ async function waitForContextRefresh(client, expected) {
   if (!client || !plain(expected)) return { contextConfirmed: true };
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
-    if (client.context && client.context.pageId === expected.pageId && client.context.pageRevision === expected.pageRevision) return { contextConfirmed: true };
+    // pageRevision is monotonic per plugin run; the UI may report a slightly
+    // newer revision than the reply if the pagechange event lands late.
+    if (client.context && client.context.pageId === expected.pageId &&
+        client.context.pageRevision >= expected.pageRevision) return { contextConfirmed: true };
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   return { contextConfirmed: false, note: '插件尚未确认新页面上下文；请重新读取状态后再继续写入' };

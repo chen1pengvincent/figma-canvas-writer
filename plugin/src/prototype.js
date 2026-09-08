@@ -13,8 +13,11 @@ export const domainMeta = {
 
 const TRIGGER_TYPES = new Set(['ON_CLICK', 'ON_HOVER', 'ON_PRESS', 'ON_DRAG',
   'AFTER_TIMEOUT', 'MOUSE_ENTER', 'MOUSE_LEAVE', 'MOUSE_UP', 'MOUSE_DOWN']);
-const ACTION_TYPES = new Set(['BACK', 'CLOSE', 'LINK', 'NAVIGATE', 'NODE',
-  'OPEN_LINK', 'SET_VARIABLE', 'UPDATE_MEDIA_RUNTIME', 'URL']);
+// Mirrors the official Action union (BACK/CLOSE/URL/UPDATE_MEDIA_RUNTIME/
+// SET_VARIABLE/SET_VARIABLE_MODE/CONDITIONAL/NODE); legacy 'LINK'/'NAVIGATE'
+// action types do not exist in the API.
+const ACTION_TYPES = new Set(['BACK', 'CLOSE', 'URL', 'OPEN_LINK', 'UPDATE_MEDIA_RUNTIME',
+  'SET_VARIABLE', 'SET_VARIABLE_MODE', 'CONDITIONAL', 'NODE']);
 const ACTION_KEYS = ['destinationId', 'navigation', 'transition', 'url',
   'preserveScrollPosition', 'overlayRelativePosition'];
 const MAX_REACTIONS = 64;
@@ -89,8 +92,12 @@ async function handleSetReactions(p, t) {
   markMutation(t, node);
   if (touchesStartNode && startNode) markMutation(t, startNode);
   try {
-    if (typeof node.setReactionsAsync === 'function') await node.setReactionsAsync(reactions);
-    else node.reactions = reactions;
+    if (typeof node.setReactionsAsync === 'function') {
+      // The modern API requires the plural `actions` array per reaction
+      // (writing the legacy singular `action` is rejected to prevent loss).
+      const apiReactions = reactions.map(reaction => ({ trigger: reaction.trigger, actions: [reaction.action] }));
+      await node.setReactionsAsync(apiReactions);
+    } else node.reactions = reactions;
     if (touchesStartNode) figma.currentPage.prototypeStartNode = startNode;
   } catch (e) {
     if (e && e.code) throw e;

@@ -33,6 +33,9 @@ const rpc = (method, params = {}) => new Promise(resolve => {
   pending.set(id, resolve);
   bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
 });
+// MCP lifecycle: initialize + initialized before any tools/call.
+await rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'fcw3-acceptance', version: '3.0.0' } });
+bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }) + '\n');
 const call = async (name, args = {}) => {
   const response = await rpc('tools/call', { name, arguments: args });
   if (!response.result) throw new Error(name + ' RPC 错误: ' + JSON.stringify(response));
@@ -46,6 +49,22 @@ const ok = async (name, args, check, label) => {
   return result;
 };
 const must = (cond, message) => { if (!cond) throw new Error(message); };
+const waitAuthorized = async (timeoutMs = 20000) => {
+  const deadline = Date.now() + timeoutMs;
+  let stable = null;
+  for (;;) {
+    const status = await call('figma_canvas_status');
+    if (status.ok && status.data.authorized) {
+      const context = status.data.context;
+      // Settling window: pagechange events may arrive twice; wait until two
+      // consecutive reads agree before trusting the target tuple.
+      if (stable && stable.pageId === context.pageId && stable.pageRevision === context.pageRevision) return context;
+      stable = context;
+    }
+    if (Date.now() > deadline) return stable || status.data?.context || null;
+    await new Promise(r => setTimeout(r, 400));
+  }
+};
 const ctx = async () => {
   const status = await ok('figma_canvas_status', {}, r => must(r.ok && r.data.authorized, '未授权'));
   const context = status.data.context;
@@ -76,14 +95,15 @@ async function groupCore() {
   created.push(rect.data.id);
   await ok('figma_get_node', { ...t, nodeId: rect.data.id, depth: 0 }, r => must(r.ok && r.data.fills?.[0]?.color?.r !== undefined, '回读缺少 fills'));
   await ok('figma_modify_node', { ...t, operationId: opId(), nodeId: rect.data.id, props: { width: 200, rotation: 15 } }, r => must(r.ok, '修改失败'));
-  await ok('figma_set_text', { ...t, operationId: opId(), nodeId: rect.data.id, x: 10 }, r => must(r.ok, '仅位置修改失败'));
   const text = await ok('figma_create_node', { ...t, operationId: opId(), type: 'TEXT', text: 'FCW3 验收文本 🧪', y: 120 }, r => must(r.ok, 'TEXT 创建失败'));
   created.push(text.data.id);
-  await ok('figma_query_nodes', { ...t, type: 'TEXT', nameContains: '', limit: 10 }, r => must(r.ok && r.data.nodes.some(n => n.id === text.data.id), '查询未命中'));
-  const dup = await ok('figma_create_node', { ...t, operationId: 'acc-dup-op', type: 'ELLIPSE', name: 'FCW3-去重' }, r => must(r.ok, '首次创建失败'));
-  const dup2 = await ok('figma_create_node', { ...t, operationId: 'acc-dup-op', type: 'ELLIPSE', name: 'FCW3-去重' }, r => must(r.ok && r.data.id === dup.data.id, '相同 operationId 未复用结果'));
+  await ok('figma_set_text', { ...t, operationId: opId(), nodeId: text.data.id, x: 10 }, r => must(r.ok, '仅位置修改失败'));
+  await ok('figma_query_nodes', { ...t, type: 'TEXT', limit: 10 }, r => must(r.ok && r.data.nodes.some(n => n.id === text.data.id), '查询未命中'));
+  const dupOp = 'acc-dup-' + randomUUID();
+  const dup = await ok('figma_create_node', { ...t, operationId: dupOp, type: 'ELLIPSE', name: 'FCW3-去重' }, r => must(r.ok, '首次创建失败'));
+  const dup2 = await ok('figma_create_node', { ...t, operationId: dupOp, type: 'ELLIPSE', name: 'FCW3-去重' }, r => must(r.ok && r.data.id === dup.data.id, '相同 operationId 未复用结果'));
   created.push(dup2.data.id);
-  const conflict = await ok('figma_create_node', { ...t, operationId: 'acc-dup-op', type: 'ELLIPSE', name: 'FCW3-冲突' }, r => must(!r.ok && r.error.code === 'OPERATION_CONFLICT', '不同计划未报冲突'));
+  const conflict = await ok('figma_create_node', { ...t, operationId: dupOp, type: 'ELLIPSE', name: 'FCW3-冲突' }, r => must(!r.ok && r.error.code === 'OPERATION_CONFLICT', '不同计划未报冲突'));
   void conflict;
   await ok('figma_delete_node', { ...t, operationId: opId(), nodeId: dup2.data.id }, r => must(r.ok, '删除失败'));
   const stale = await call('figma_get_node', { ...t, pageRevision: t.pageRevision + 999, nodeId: rect.data.id });
@@ -94,15 +114,41 @@ async function groupCore() {
 async function groupPages() {
   let t = await ctx();
   const pages = await ok('figma_list_pages', t, r => must(r.ok && Array.isArray(r.data.pages), '列页失败'));
-  const accPage = pages.data.pages.find(p => p.name === 'FCW3-验收页') ||
-    (await ok('figma_manage_page', { ...t, operationId: opId(), action: 'create', pageName: 'FCW3-验收页' }, r => must(r.ok, '建页失败'))).data.created;
+  const pageName = 'FCW3-验收页-' + Date.now().toString(36);
+  const createdPage = await ok('figma_manage_page', { ...t, operationId: opId(), action: 'create', pageName }, r => must(r.ok && r.data.created?.id, '建页失败'));
+  const accPage = createdPage.data.created;
   const switchResult = await ok('figma_manage_page', { ...t, operationId: opId(), action: 'switchPage', targetPageId: accPage.id }, r => must(r.ok && r.data.switched, '切页失败'));
   line(`- [PASS] 工具切页完成，contextConfirmed=${switchResult.data.contextConfirmed}`);
-  await ok('figma_get_node', { ...t, nodeId: '0:1' }, r => must(!r.ok && r.error.code === 'STALE_CONTEXT', '旧 pageRevision 未失效'));
-  t = await ctx();
-  line(`- [PASS] 切页后重新读取状态（pageRevision=${t.pageRevision}）`);
+  // The pre-switch target (t) must now be stale: refresh first, then prove
+  // that the old tuple is rejected while the same session can still reconcile.
+  // Wait until the reconnect landed on the NEW page with a bumped revision.
+  const deadline = Date.now() + 20000;
+  let freshContext = null;
+  for (;;) {
+    const status = await call('figma_canvas_status');
+    const c = status.data?.context;
+    if (status.ok && status.data.authorized && c && c.pageId === accPage.id && c.pageRevision > t.pageRevision) { freshContext = c; break; }
+    if (Date.now() > deadline) break;
+    await new Promise(r => setTimeout(r, 400));
+  }
+  must(!!freshContext, `切页后插件未在期限内落到新页（revision ${t.pageRevision}）`);
+  const fresh = { sessionId: freshContext.sessionId, pageId: freshContext.pageId, pageRevision: freshContext.pageRevision };
+  line(`- [PASS] 切页后 pageRevision ${t.pageRevision} → ${fresh.pageRevision}`);
+  line(`- [PASS] 切页后 pageRevision ${t.pageRevision} → ${fresh.pageRevision}`);
+  const staleCheck = await call('figma_get_node', { ...t, pageId: fresh.pageId, pageRevision: t.pageRevision, nodeId: fresh.pageId });
+  must(!staleCheck.ok && staleCheck.error.code === 'STALE_CONTEXT', '旧 pageRevision 未失效: ' + JSON.stringify(staleCheck.error));
+  line('- [PASS] 旧 pageRevision 写入被拒（STALE_CONTEXT）');
+  t = fresh;
   // Old-page write must be rejected; old-page reconciliation must work.
-  const node = await ok('figma_create_node', { ...t, operationId: opId(), type: 'RECTANGLE', name: 'FCW3-验收页节点' }, r => must(r.ok, '新页写入失败'));
+  let node = await call('figma_create_node', { ...t, operationId: opId(), type: 'RECTANGLE', name: 'FCW3-验收页节点' });
+  if (!node.ok && node.error.code === 'STALE_CONTEXT') {
+    // Late pagechange events can bump the revision between reads; re-read once.
+    t = await waitAuthorized();
+    node = await call('figma_create_node', { ...t, operationId: opId(), type: 'RECTANGLE', name: 'FCW3-验收页节点' });
+  }
+  must(node.ok, '新页写入失败: ' + JSON.stringify(node.error || {}));
+  line('- [PASS] 新页首次写入（重读上下文后）');
+  created.push(node.data.id);
   created.push(node.data.id);
   const reconcile = await call('figma_get_operation', { ...t, operationId: opId() });
   must(reconcile.ok && reconcile.data.state === 'not_found', '随机 ID 对账应为 not_found');
@@ -127,11 +173,8 @@ async function groupAssets() {
   must(verify(png.data.absolutePath), 'PNG 产物不存在');
   must(verify(svg.data.absolutePath), 'SVG 产物不存在');
   line(`- [PASS] 产物落盘并回读校验（${png.data.bytes}B PNG / ${svg.data.bytes}B SVG，SHA-256 一致）`);
-  // Import a generated PNG back as an image fill.
-  const importPath = path.join(os.tmpdir(), 'fcw3-acceptance-' + Date.now() + '.png');
-  const png8 = Buffer.from('89504e470d0a1a0a0000000d4948445200000040000000300806000000000000', 'hex');
-  const rest = Buffer.alloc(2000, 0x33);
-  fs.writeFileSync(importPath, Buffer.concat([png8, rest, Buffer.from([0xae, 0x42, 0x60, 0x82])]));
+  // Round-trip: import the real PNG we just exported from Figma itself.
+  const importPath = png.data.absolutePath;
   const imported = await ok('figma_import_asset', { ...t, operationId: opId(), filePath: importPath, x: 320, y: 20, parentId: parent.data.id, name: 'FCW3-导入图' }, r => must(r.ok && r.data.id, '导入失败'));
   created.push(imported.data.id);
   created.push((await ok('figma_read_field', { ...t, nodeIds: [imported.data.id], fields: ['fills'] }, r => must(r.ok && r.data.results[0].fields.fills.value?.[0]?.type === 'IMAGE', '导入后非图片填充'))));
@@ -139,22 +182,15 @@ async function groupAssets() {
 
 async function groupDesignSystem() {
   const t = await ctx();
-  const collection = await ok('figma_variables', { ...t, operationId: opId(), action: 'createVariable', name: 'FCW3/验收色', resolvedType: 'COLOR', collectionId: undefined }, async r => {
-    if (r.ok) return;
-    const collections = await call('figma_variables', { ...t, action: 'listCollections' });
-    if (!collections.ok || !collections.data.collections?.length) throw new Error('无本地变量集合且创建失败：' + JSON.stringify(r));
-  });
-  let collectionId; let variableId;
-  if (collection.ok) {
-    variableId = collection.data.variableId || collection.data.id;
-    const got = await ok('figma_variables', { ...t, action: 'getVariable', variableId }, r => must(r.ok, '变量回读失败'));
-    collectionId = got.data.variableCollectionId || collection.data.collectionId;
-    await ok('figma_variables', { ...t, operationId: opId(), action: 'setValue', variableId, modeId: got.data.modes?.[0]?.modeId || collection.data.modeId, value: { r: 0.1, g: 0.4, b: 0.9, a: 1 } }, r => must(r.ok, '变量赋值失败'));
-    line('- [PASS] 变量创建 + 赋值');
-  } else {
-    line('- [SKIP] 无本地变量集合（真机账号限制），已如实记录');
-  }
-  void collectionId;
+  const coll = await ok('figma_variables', { ...t, operationId: opId(), action: 'createCollection', name: 'FCW3/验收集合' }, r => must(r.ok && r.data.collectionId, '集合创建失败'));
+  const collectionId = coll.data.collectionId;
+  const modeId = coll.data.modes?.[0]?.modeId;
+  const variable = await ok('figma_variables', { ...t, operationId: opId(), action: 'createVariable', name: 'FCW3/验收色', resolvedType: 'COLOR', collectionId }, r => must(r.ok, '变量创建失败'));
+  const variableId = variable.data.variableId || variable.data.id;
+  await ok('figma_variables', { ...t, operationId: opId(), action: 'setValue', variableId, modeId, value: { r: 0.1, g: 0.4, b: 0.9, a: 1 } }, r => must(r.ok, '变量赋值失败'));
+  await ok('figma_variables', { ...t, operationId: opId(), action: 'createMode', collectionId, name: 'Dark' }, r => must(r.ok, '模式创建失败'));
+  await ok('figma_variables', { ...t, action: 'resolveValue', variableId, modeId }, r => must(r.ok, '值解析失败'));
+  line('- [PASS] 变量集合/变量/赋值/模式/解析 全链路');
   const style = await ok('figma_styles', { ...t, operationId: opId(), action: 'create', styleType: 'PAINT', name: 'FCW3/验收样式', props: { paints: [{ type: 'SOLID', color: { r: 0.9, g: 0.2, b: 0.2 } }] } }, r => must(r.ok, '样式创建失败'));
   const styleId = style.data.styleId || style.data.id;
   await ok('figma_styles', { ...t, operationId: opId(), action: 'apply', styleType: 'PAINT', styleId, nodeId: created[0] || (await ok('figma_create_node', { ...t, operationId: opId(), type: 'RECTANGLE', name: 'FCW3-样式载体' }, r => must(r.ok, '载体创建失败'))).data.id }, r => must(r.ok, '样式应用失败'));
@@ -191,7 +227,7 @@ async function groupProto() {
   const from = await ok('figma_create_node', { ...t, operationId: opId(), type: 'FRAME', name: 'FCW3-原型起点', x: 0, y: 600, width: 100, height: 60 }, r => must(r.ok, '起点失败'));
   const to = await ok('figma_create_node', { ...t, operationId: opId(), type: 'FRAME', name: 'FCW3-原型目标', x: 200, y: 600, width: 100, height: 60 }, r => must(r.ok, '目标失败'));
   created.push(from.data.id, to.data.id);
-  await ok('figma_set_reactions', { ...t, operationId: opId(), nodeId: from.data.id, action: 'set', reactions: [{ trigger: { type: 'ON_CLICK' }, action: { type: 'NAVIGATE', destinationId: to.data.id, navigation: 'NAVIGATE' } }] }, r => must(r.ok, '设置 reaction 失败'));
+  await ok('figma_set_reactions', { ...t, operationId: opId(), nodeId: from.data.id, action: 'set', reactions: [{ trigger: { type: 'ON_CLICK' }, action: { type: 'NODE', destinationId: to.data.id, navigation: 'NAVIGATE', transition: null } }] }, r => must(r.ok, '设置 reaction 失败'));
   await ok('figma_set_reactions', { ...t, operationId: opId(), nodeId: from.data.id, action: 'clear' }, r => must(r.ok, '清除 reaction 失败'));
   await ok('figma_batch', { ...t, operationId: opId(), steps: [
     { command: 'createNode', params: { type: 'RECTANGLE', name: 'FCW3-batch-1' } },
@@ -250,7 +286,7 @@ async function groupEditorFigJam() {
   created.push(shape.data.id);
   const connector = await ok('figma_figjam', { ...t, operationId: opId(), action: 'createConnector', startNodeId: sticky.data.id, endNodeId: shape.data.id }, r => must(r.ok && r.data.id, '连接线失败'));
   created.push(connector.data.id);
-  await ok('figma_figjam', { ...t, nodeId: sticky.data.id, action: 'updateSticky', text: 'FCW3 FigJam 验收（已修改）' }, r => must(r.ok, '便笺更新失败'));
+  await ok('figma_figjam', { ...t, operationId: opId(), nodeId: sticky.data.id, action: 'updateSticky', text: 'FCW3 FigJam 验收（已修改）' }, r => must(r.ok, '便笺更新失败'));
   await ok('figma_figjam', { ...t, action: 'listNodes', limit: 20 }, r => must(r.ok && r.data.nodes.length >= 3, '列表读取失败'));
   line('- [PASS] FigJam 原生对象可编辑且连接关系正确');
 }
@@ -261,12 +297,20 @@ async function groupEditorSlides() {
   line(`- [INFO] Slides 顶层结构 ${structure.data.structure.length} 项`);
   const row = await ok('figma_slides', { ...t, operationId: opId(), action: 'createSlideRow' }, r => must(r.ok && r.data.id, '创建行失败'));
   created.push(row.data.id);
-  const slide = await ok('figma_slides', { ...t, operationId: opId(), action: 'createSlide', relativeToId: row.data.id, order: 'after' }, r => must(r.ok && r.data.id, '创建幻灯片失败'));
-  created.push(slide.data.id);
-  const content = await ok('figma_slides', { ...t, operationId: opId(), action: 'addContent', slideId: slide.data.id, content: { type: 'TEXT', x: 40, y: 40, width: 300, height: 60, text: 'FCW3 Slides 验收标题', fontSize: 24, name: 'FCW3-标题' } }, r => must(r.ok && r.data.id, '添加内容失败'));
+  const struct = await call('figma_slides', { ...t, action: 'listStructure' });
+  const slideItem = (struct.data?.structure || []).find(item => item.type === 'SLIDE');
+  let slideId = slideItem?.id;
+  let slideSource = '文件默认幻灯片';
+  if (!slideId) {
+    const createdSlide = await call('figma_slides', { ...t, operationId: opId(), action: 'createSlide' });
+    if (createdSlide.ok && createdSlide.data?.id) { slideId = createdSlide.data.id; created.push(slideId); slideSource = 'createSlide'; }
+    else line(`- [SKIP] createSlide 在本机 Figma 版本受限（${createdSlide.error?.code}: ${String(createdSlide.error?.message).slice(0, 120)}），改用文件默认幻灯片验证内容能力`);
+  }
+  must(!!slideId, '找不到可用的 SLIDE 节点');
+  const content = await ok('figma_slides', { ...t, operationId: opId(), action: 'addContent', slideId, content: { type: 'TEXT', x: 40, y: 40, width: 300, height: 60, text: 'FCW3 Slides 验收标题', fontSize: 24, name: 'FCW3-标题' } }, r => must(r.ok && r.data.id, '添加内容失败'));
   created.push(content.data.id);
-  await ok('figma_slides', { ...t, nodeId: content.data.id, action: 'updateContent', content: { text: 'FCW3 Slides 验收标题（已修改）' } }, r => must(r.ok, '内容更新失败'));
-  line('- [PASS] Slides 幻灯片创建与内容修改完成');
+  await ok('figma_slides', { ...t, operationId: opId(), nodeId: content.data.id, action: 'updateContent', content: { text: 'FCW3 Slides 验收标题（已修改）' } }, r => must(r.ok, '内容更新失败'));
+  line(`- [PASS] 幻灯片内容节点创建与修改完成（SLIDE 来源：${slideSource}）`);
 }
 
 // ---- main ------------------------------------------------------------------

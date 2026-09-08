@@ -6,7 +6,7 @@ import { makePlugin, success, failure, plain, test } from './helpers/figma-vm.js
 const clickNav = (destinationId) => ({
   trigger: { type: 'ON_CLICK' },
   action: {
-    type: 'NAVIGATE', destinationId, navigation: 'NAVIGATE',
+    type: 'NODE', destinationId, navigation: 'NAVIGATE',
     transition: { type: 'SMART_ANIMATE', duration: 300, easing: { type: 'EASE_IN_AND_OUT' } },
   },
 });
@@ -47,7 +47,11 @@ test('setReactions writes via setReactionsAsync with whitelist passthrough and r
   assert.equal(data.state, 'succeeded');
   assert.ok(data.affectedNodeIds.includes(target.id), JSON.stringify(data));
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0], [clickNav(destination.id), timeoutBack]);
+  // setReactionsAsync receives the modern plural `actions` form.
+  assert.deepEqual(calls[0], [
+    { trigger: clickNav(destination.id).trigger, actions: [clickNav(destination.id).action] },
+    { trigger: timeoutBack.trigger, actions: [timeoutBack.action] },
+  ]);
   assert.deepEqual(data.reactions, calls[0]);
   assert.equal(data.reactionsCount, 2);
   assert.equal(data.prototypeStartNodeId, null);

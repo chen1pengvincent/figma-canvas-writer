@@ -1,19 +1,21 @@
 // Page listing and management. Switching pages is a standalone context
 // operation with its own reconciliation; never mixed into a normal batch.
 import { appErr, requireStr, onlyKeys } from './util.js';
-import { getContext, assertTarget, assertAuthGeneration } from './context.js';
+import { getContext, assertTarget, assertAuthGeneration, bumpPageRevision } from './context.js';
 
 export const handlers = {
   async listPages(p, t) {
     onlyKeys(p, []);
     assertTarget(t);
     const pages = figma.root.children.filter(child => child.type === 'PAGE');
+    // dynamic-page: only the current page has children loaded; report null
+    // for the rest instead of paying a loadAsync per page.
     return {
       ...getContext(),
       pages: pages.map(page => ({
         id: page.id, name: String(page.name).slice(0, 1024),
         isCurrent: page.id === figma.currentPage.id,
-        childCount: (page.children || []).length,
+        childCount: page.id === figma.currentPage.id ? page.children.length : null,
       })),
     };
   },
@@ -47,10 +49,12 @@ export const handlers = {
       if (page.id === figma.currentPage.id) return { ...getContext(), switched: true };
       const sourcePageId = figma.currentPage.id;
       const targetPageId = page.id;
-      // The currentpagechange listener bumps the page revision and publishes
-      // the new context; this handler only verifies the authorization survives.
       await figma.setCurrentPageAsync(page);
-      assertAuthGeneration(t);
+      assertAuthGeneration(t); // must still hold the same authorization generation
+      // The currentpagechange event may fire asynchronously after this point;
+      // bump here so the reply's context is already monotonically newer. The
+      // listener's own bump is harmless (the counter only needs monotonicity).
+      bumpPageRevision();
       return { ...getContext(), switched: true, sourcePageId, targetPageId };
     }
     throw appErr('INVALID_PARAM', '未知页面动作');

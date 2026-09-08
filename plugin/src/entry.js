@@ -42,6 +42,10 @@ export function pluginSchemaFor(command) {
   const source = override || tool.inputSchema;
   const schema = JSON.parse(JSON.stringify(source));
   for (const key of ['sessionId', 'pageId', 'pageRevision', 'operationId']) delete schema.properties[key];
+  // The bridge injects a transferId for resource-bearing commands.
+  if (['getScreenshot', 'exportAsset', 'importAsset'].includes(command)) {
+    schema.properties.transferId = { type: 'string', maxLength: 64 };
+  }
   // The bridge maps the tool-level nodeId to the wire-level id.
   if (Object.prototype.hasOwnProperty.call(schema.properties, 'nodeId')) {
     schema.properties.id = schema.properties.nodeId;

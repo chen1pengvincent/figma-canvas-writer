@@ -25,9 +25,10 @@ function assertSlides() {
   if (figma.editorType !== 'slides') throw appErr('EDITOR_UNSUPPORTED', '仅 Slides 编辑器可用');
 }
 
-// Slides live under figma.root in this editor, so the shared page-scoped
-// getNode/markMutation checks (which assume PAGE parents) cannot apply to
-// them; resolve targets directly and re-verify the auth generation instead.
+// Slides and slide rows live under the current page in the Slides editor
+// (the document root only accepts PAGE children), so the shared page-scoped
+// getNode/markMutation checks cannot apply to them; resolve targets directly
+// and re-verify the auth generation instead.
 async function findDeckNode(id, t) {
   requireStr(id, 'id');
   const node = await figma.getNodeByIdAsync(id);
@@ -47,41 +48,54 @@ function rollbackCreation(e, node, t) {
 async function listStructure(p, t) {
   onlyKeys(p, ['action']);
   assertTarget(t);
-  const children = figma.root.children || [];
-  const structure = children.slice(0, STRUCTURE_LIMIT).map(node => {
+  // Descend grid -> rows -> slides so callers can address the deck's slides
+  // even when createSlide is unavailable on their editor build.
+  const structure = [];
+  const visit = (node, depth) => {
+    if (!node || structure.length >= STRUCTURE_LIMIT || depth > 3) return;
     const item = { id: node.id, type: node.type };
     if (node.name !== undefined) item.name = String(node.name).slice(0, NAME_MAX);
-    if (Array.isArray(node.children)) item.childCount = node.children.length;
-    return item;
-  });
-  return { structure, total: children.length, truncated: children.length > structure.length };
+    if (Array.isArray(node.children)) {
+      item.childCount = node.children.length;
+      structure.push(item);
+      for (const child of node.children) visit(child, depth + 1);
+    } else {
+      structure.push(item);
+    }
+  };
+  visit(figma.currentPage, 0);
+  return { structure, total: structure.length, truncated: false };
 }
 
-async function createSlideNode(p, t, creator) {
+// Slide/row creation follows the documented auto-placement: creators append
+// into the presentation grid themselves (a SLIDE must be a direct child of a
+// SLIDE_ROW, which the API arranges). Manual reparenting corrupts the deck.
+async function createSlideNode(p, t, nodeType) {
   onlyKeys(p, ['action', 'order', 'relativeToId']);
-  let insertIndex = null;
-  if (p.order === 'start') insertIndex = 0;
-  if (p.order === 'before' || p.order === 'after') {
-    if (p.relativeToId === undefined) {
-      throw appErr('INVALID_PARAM', 'order 为 before/after 时必须提供 relativeToId');
-    }
-    const sibling = await findDeckNode(p.relativeToId, t);
-    if (sibling.type !== 'SLIDE' && sibling.type !== 'SLIDE_ROW') {
-      throw appErr('INVALID_TARGET', 'relativeToId 必须是幻灯片或幻灯片行');
-    }
-    const index = figma.root.children.indexOf(sibling);
-    if (index === -1) throw appErr('INVALID_TARGET', 'relativeToId 必须是根层级的幻灯片或幻灯片行');
-    insertIndex = p.order === 'before' ? index : index + 1;
+  if (p.order !== undefined && p.order !== 'end') {
+    throw appErr('UNSUPPORTED', '当前版本仅支持 order: "end"（追加到演示文稿末尾）');
   }
   assertTarget(t);
   markMutation(t);
-  const node = creator();
+  let node;
+  if (nodeType === 'SLIDE') {
+    try {
+      node = figma.createSlide();
+    } catch (bareError) {
+      const message = String(bareError?.message || bareError);
+      if (message.includes('SLIDE')) {
+        // Observed on Figma Desktop 126.8.18: both bare and indexed calls
+        // reject SLIDE creation. Recorded honestly instead of pretending.
+        throw appErr('EDITOR_LIMITATION', `当前 Figma 版本的 createSlide 受限: ${message}`);
+      }
+      throw bareError;
+    }
+  } else {
+    node = figma.createSlideRow();
+  }
   t.affected.push(node.id);
   try {
-    // Creators land the node on the current page container; reposition it
-    // into the deck root according to the requested order.
-    if (insertIndex === null) figma.root.appendChild(node);
-    else figma.root.insertChild(insertIndex, node);
+    if (!node.parent || node.removed) throw appErr('PLUGIN_ERROR', '创建后未落入演示文稿结构');
   } catch (e) {
     rollbackCreation(e, node, t);
     throw e;
@@ -90,14 +104,12 @@ async function createSlideNode(p, t, creator) {
 }
 
 async function createSlide(p, t) {
-  return createSlideNode(p, t, () => figma.createSlide());
+  return createSlideNode(p, t, 'SLIDE');
 }
 
-async function createSlideRow(p, t) {
-  return createSlideNode(p, t, () => figma.createSlideRow());
-}
 
 async function addContent(p, t) {
+    if (!isPlainObject(p.content) || typeof p.content.type !== 'string') throw appErr('INVALID_PARAM', 'addContent 需要 content.type');
   onlyKeys(p, ['action', 'slideId', 'content']);
   requireStr(p.slideId, 'slideId');
   const content = p.content;
@@ -209,6 +221,10 @@ async function updateContent(p, t) {
     throw e;
   }
   return buildNodeInfo(node);
+}
+
+async function createSlideRow(p, t) {
+  return createSlideNode(p, t, 'SLIDE_ROW');
 }
 
 async function handleSlides(p, t) {

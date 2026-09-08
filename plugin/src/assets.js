@@ -155,7 +155,7 @@ async function handleGetScreenshot(p, t, msg) {
 
 // ---- import ----------------------------------------------------------------
 async function handleImportAsset(p, t) {
-  onlyKeys(p, ['format', 'fileName', 'totalBytes', 'totalSha256', 'assetBase64', 'x', 'y', 'parentId', 'name']);
+  onlyKeys(p, ['format', 'fileName', 'totalBytes', 'totalSha256', 'assetBase64', 'x', 'y', 'parentId', 'name', 'transferId']);
   const format = requireStr(p.format, 'format').toUpperCase();
   if (p.assetBase64 === undefined) throw appErr('INVALID_ASSET', '资源未传输完整');
   const bytes = base64ToBytes(p.assetBase64);
@@ -214,7 +214,8 @@ async function handleImportAsset(p, t) {
   } catch (e) {
     if (e && e.code) throw e;
     if (node && !node.removed) { try { node.remove(); } catch {} }
-    throw appErr('IMPORT_FAILED', '导入失败: ' + (e && e.message ? e.message : String(e)));
+    const detail = e instanceof Error ? (e.message || String(e)) : JSON.stringify(e);
+    throw appErr('IMPORT_FAILED', '导入失败: ' + detail);
   }
 }
 
