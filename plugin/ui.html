@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>Figma Canvas Writer 2</title>
+<title>Figma Canvas Writer 3</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -22,7 +22,7 @@
 </style>
 </head>
 <body>
-<div class="panelTitle">Figma Canvas Writer 2</div>
+<div class="panelTitle">Figma Canvas Writer 3</div>
 <div id="statusRow"><span id="dot" class="dot"></span><span id="statusText">初始化…</span></div>
 <div id="detail"></div>
 <div id="pairArea">
@@ -75,17 +75,25 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 */
-(()=>{var W=Object.defineProperty;var X=(e,t,n)=>t in e?W(e,t,{enumerable:!0,configurable:!0,writable:!0,value:n}):e[t]=n;var c=(e,t,n)=>X(e,typeof t!="symbol"?t+"":t,n);function O(e){return e instanceof Uint8Array||ArrayBuffer.isView(e)&&e.constructor.name==="Uint8Array"&&"BYTES_PER_ELEMENT"in e&&e.BYTES_PER_ELEMENT===1}var U=e=>e?`"${e}" `:"";function S(e,t=""){if(typeof e!="number")throw new TypeError(U(t)+"expected number, got "+typeof e);if(!Number.isSafeInteger(e)||e<0)throw new RangeError(U(t)+"expected integer >= 0, got "+e);return e}function w(e,t,n=""){if(O(e)&&(t===void 0||e.length===t))return e;t!==void 0&&S(t,"length");let r=O(e),o=t!==void 0?` of length ${t}`:"",s=r?`length=${e.length}`:`type=${typeof e}`,i=U(n)+"expected Uint8Array"+o+", got "+s;throw r?new RangeError(i):new TypeError(i)}function D(e){if(typeof e!="function"||typeof e.create!="function")throw new TypeError("expected hash wrapped by utils.createHasher");if(S(e.outputLen),S(e.blockLen),e.outputLen<1||e.blockLen<1)throw new Error("hash blockLen / outputLen must be >= 1")}var K=(e,t)=>{if(e===null||typeof e!="object"||Array.isArray(e))throw new TypeError((t==="object"?"":`"${t}" `)+"expected object, got type="+typeof e)},C=(e,t)=>{K(e,t);let n=Object.getPrototypeOf(e);if(n!==Object.prototype&&n!==null)throw new TypeError(`"${t}" expected plain object`);if(Object.hasOwn(e,"__proto__"))throw new TypeError(`"${t}.__proto__" is not allowed`)};function y(e,t=!0){if(e.destroyed)throw new Error("hash was destroyed");if(t&&e.finished)throw new Error("digest() was already called")}function m(e,t){w(e,void 0,"output");let n=t.outputLen;if(!(e.length>=n))throw new RangeError('"output" expected length >= '+n)}function H(...e){for(let t=0;t<e.length;t++)e[t].fill(0)}function A(e){return new DataView(e.buffer,e.byteOffset,e.byteLength)}function d(e,t){return e<<32-t|e>>>t}function P(e,t,n="opts"){return C(e,"defaults"),t!==void 0&&C(t,n),Object.assign(Object.create(null),e,t)}function j(e,t={}){if(typeof e!="function")throw new TypeError('"hashCons" expected function, got type='+typeof e);t=P({},t,"info");let n=(o,s)=>e(s).update(o).digest(),r=e(void 0);return n.outputLen=r.outputLen,n.blockLen=r.blockLen,n.canXOF=r.canXOF,n.create=o=>e(o),Object.assign(n,t),Object.freeze(n)}var k=e=>({oid:Uint8Array.from([6,9,96,134,72,1,101,3,4,2,e])});var L=class{constructor(t,n){c(this,"oHash");c(this,"iHash");c(this,"blockLen");c(this,"outputLen");c(this,"canXOF",!1);c(this,"finished",!1);c(this,"destroyed",!1);if(D(t),w(n,void 0,"key"),this.iHash=t.create(),typeof this.iHash.update!="function")throw new Error("expected Hash instance");this.blockLen=this.iHash.blockLen,this.outputLen=this.iHash.outputLen;let r=this.blockLen,o=new Uint8Array(r);o.set(n.length>r?t.create().update(n).digest():n);for(let s=0;s<o.length;s++)o[s]^=54;this.iHash.update(o),this.oHash=t.create();for(let s=0;s<o.length;s++)o[s]^=106;this.oHash.update(o),H(o)}update(t){return y(this),this.iHash.update(t),this}digestInto(t){y(this),m(t,this),this.finished=!0;let n=t.subarray(0,this.outputLen);this.iHash.digestInto(n),this.oHash.update(n),this.oHash.digestInto(n),this.destroy()}digest(){let t=new Uint8Array(this.oHash.outputLen);return this.digestInto(t),t}_cloneInto(t){t||(t=Object.create(Object.getPrototypeOf(this),{}));let{oHash:n,iHash:r,finished:o,destroyed:s,blockLen:i,outputLen:a,canXOF:f}=this;return t=t,t.finished=o,t.destroyed=s,t.blockLen=i,t.outputLen=a,t.canXOF=f,t.oHash=n._cloneInto(t.oHash),t.iHash=r._cloneInto(t.iHash),t}clone(){return this._cloneInto()}destroy(){this.destroyed=!0,this.oHash.destroy(),this.iHash.destroy()}},G=(()=>{let e=((t,n,r)=>new L(t,n).update(r).digest());return e.create=(t,n)=>new L(t,n),e})();var z=e=>e/2**32|0,J=e=>e>>>0;function I(e,t,n,r){let o=z(n),s=J(n);e.setUint32(t,r?s:o,r),e.setUint32(t+4,r?o:s,r)}function $(e,t,n){return e&t^~e&n}function M(e,t,n){return e&t^e&n^t&n}var E=class{constructor(t,n,r,o){c(this,"blockLen");c(this,"outputLen");c(this,"canXOF",!1);c(this,"padOffset");c(this,"isLE");c(this,"buffer");c(this,"view");c(this,"finished",!1);c(this,"length",0);c(this,"pos",0);c(this,"destroyed",!1);this.blockLen=t,this.outputLen=n,this.padOffset=r,this.isLE=o,this.buffer=new Uint8Array(t),this.view=A(this.buffer)}update(t){y(this),w(t);let{view:n,buffer:r,blockLen:o}=this,s=t.length,i=!1;for(let a=0;a<s;){let f=Math.min(o-this.pos,s-a);if(f===o){let x=A(t);for(;o<=s-a;a+=o)this.process(x,a);i=!0;continue}r.set(a===0&&f===s?t:t.subarray(a,a+f),this.pos),this.pos+=f,a+=f,this.pos===o&&(this.process(n,0),this.pos=0,i=!0)}return this.length+=t.length,i&&this.roundClean(),this}digestInto(t){y(this),m(t,this),this.finished=!0;let{buffer:n,view:r,blockLen:o,isLE:s}=this,{pos:i}=this;n[i++]=128,n.fill(0,i),this.padOffset>o-i&&(this.process(r,0),n.fill(0)),I(r,o-8,this.length*8,s),this.process(r,0),this.roundClean();let a=t===n?r:A(t),f=this.outputLen,x=f/4,b=this.get();if(f%4||x>b.length)throw new Error("invalid outputLen");for(let u=0;u<x;u++)a.setUint32(4*u,b[u],s)}digest(){let{buffer:t,outputLen:n}=this;this.digestInto(t);let r=t.slice(0,n);return this.destroy(),r}_cloneIntoMeta(t){let{buffer:n,length:r,finished:o,destroyed:s,pos:i}=this;return t.destroyed=s,t.finished=o,t.length=r,t.pos=i,i&&t.buffer.set(n),t}clone(){return this._cloneInto()}},R=Uint32Array.from([1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225]);var Y=Uint32Array.from([1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298]),l=new Uint32Array(64),_=class extends E{constructor(n,r){super(64,n,8,!1);c(this,"A",0);c(this,"B",0);c(this,"C",0);c(this,"D",0);c(this,"E",0);c(this,"F",0);c(this,"G",0);c(this,"H",0);this.A=r[0]|0,this.B=r[1]|0,this.C=r[2]|0,this.D=r[3]|0,this.E=r[4]|0,this.F=r[5]|0,this.G=r[6]|0,this.H=r[7]|0}get(){let{A:n,B:r,C:o,D:s,E:i,F:a,G:f,H:x}=this;return[n,r,o,s,i,a,f,x]}set(n,r,o,s,i,a,f,x){this.A=n|0,this.B=r|0,this.C=o|0,this.D=s|0,this.E=i|0,this.F=a|0,this.G=f|0,this.H=x|0}_cloneInto(n){return(n||(n=new this.constructor)).set(...this.get()),this._cloneIntoMeta(n)}process(n,r){for(let h=0;h<16;h++,r+=4)l[h]=n.getUint32(r,!1);for(let h=16;h<64;h++){let g=l[h-15],p=l[h-2],F=d(g,7)^d(g,18)^g>>>3,B=d(p,17)^d(p,19)^p>>>10;l[h]=B+l[h-7]+F+l[h-16]|0}let{A:o,B:s,C:i,D:a,E:f,F:x,G:b,H:u}=this;for(let h=0;h<64;h++){let g=d(f,6)^d(f,11)^d(f,25),p=u+g+$(f,x,b)+Y[h]+l[h]|0,B=(d(o,2)^d(o,13)^d(o,22))+M(o,s,i)|0;u=b,b=x,x=f,f=a+p|0,a=i,i=s,s=o,o=p+B|0}o=o+this.A|0,s=s+this.B|0,i=i+this.C|0,a=a+this.D|0,f=f+this.E|0,x=x+this.F|0,b=b+this.G|0,u=u+this.H|0,this.set(o,s,i,a,f,x,b,u)}roundClean(){H(l)}destroy(){this.destroyed=!0,this.set(0,0,0,0,0,0,0,0),H(this.buffer)}},T=class extends _{constructor(){super(32,R)}};var N=j(()=>new T,k(1));window.FCWCrypto=Object.freeze({hmacSha256(e,t){return G(N,e,t)},equalBytes(e,t){if(!(e instanceof Uint8Array)||!(t instanceof Uint8Array)||e.length!==t.length)return!1;let n=0;for(let r=0;r<e.length;r++)n|=e[r]^t[r];return n===0}});})();
+(()=>{var W=Object.defineProperty;var X=(e,t,n)=>t in e?W(e,t,{enumerable:!0,configurable:!0,writable:!0,value:n}):e[t]=n;var c=(e,t,n)=>X(e,typeof t!="symbol"?t+"":t,n);function C(e){return e instanceof Uint8Array||ArrayBuffer.isView(e)&&e.constructor.name==="Uint8Array"&&"BYTES_PER_ELEMENT"in e&&e.BYTES_PER_ELEMENT===1}var S=e=>e?`"${e}" `:"";function _(e,t=""){if(typeof e!="number")throw new TypeError(S(t)+"expected number, got "+typeof e);if(!Number.isSafeInteger(e)||e<0)throw new RangeError(S(t)+"expected integer >= 0, got "+e);return e}function w(e,t,n=""){if(C(e)&&(t===void 0||e.length===t))return e;t!==void 0&&_(t,"length");let r=C(e),o=t!==void 0?` of length ${t}`:"",s=r?`length=${e.length}`:`type=${typeof e}`,i=S(n)+"expected Uint8Array"+o+", got "+s;throw r?new RangeError(i):new TypeError(i)}function j(e){if(typeof e!="function"||typeof e.create!="function")throw new TypeError("expected hash wrapped by utils.createHasher");if(_(e.outputLen),_(e.blockLen),e.outputLen<1||e.blockLen<1)throw new Error("hash blockLen / outputLen must be >= 1")}var K=(e,t)=>{if(e===null||typeof e!="object"||Array.isArray(e))throw new TypeError((t==="object"?"":`"${t}" `)+"expected object, got type="+typeof e)},D=(e,t)=>{K(e,t);let n=Object.getPrototypeOf(e);if(n!==Object.prototype&&n!==null)throw new TypeError(`"${t}" expected plain object`);if(Object.hasOwn(e,"__proto__"))throw new TypeError(`"${t}.__proto__" is not allowed`)};function y(e,t=!0){if(e.destroyed)throw new Error("hash was destroyed");if(t&&e.finished)throw new Error("digest() was already called")}function m(e,t){w(e,void 0,"output");let n=t.outputLen;if(!(e.length>=n))throw new RangeError('"output" expected length >= '+n)}function H(...e){for(let t=0;t<e.length;t++)e[t].fill(0)}function A(e){return new DataView(e.buffer,e.byteOffset,e.byteLength)}function d(e,t){return e<<32-t|e>>>t}function P(e,t,n="opts"){return D(e,"defaults"),t!==void 0&&D(t,n),Object.assign(Object.create(null),e,t)}function k(e,t={}){if(typeof e!="function")throw new TypeError('"hashCons" expected function, got type='+typeof e);t=P({},t,"info");let n=(o,s)=>e(s).update(o).digest(),r=e(void 0);return n.outputLen=r.outputLen,n.blockLen=r.blockLen,n.canXOF=r.canXOF,n.create=o=>e(o),Object.assign(n,t),Object.freeze(n)}var G=e=>({oid:Uint8Array.from([6,9,96,134,72,1,101,3,4,2,e])});var L=class{constructor(t,n){c(this,"oHash");c(this,"iHash");c(this,"blockLen");c(this,"outputLen");c(this,"canXOF",!1);c(this,"finished",!1);c(this,"destroyed",!1);if(j(t),w(n,void 0,"key"),this.iHash=t.create(),typeof this.iHash.update!="function")throw new Error("expected Hash instance");this.blockLen=this.iHash.blockLen,this.outputLen=this.iHash.outputLen;let r=this.blockLen,o=new Uint8Array(r);o.set(n.length>r?t.create().update(n).digest():n);for(let s=0;s<o.length;s++)o[s]^=54;this.iHash.update(o),this.oHash=t.create();for(let s=0;s<o.length;s++)o[s]^=106;this.oHash.update(o),H(o)}update(t){return y(this),this.iHash.update(t),this}digestInto(t){y(this),m(t,this),this.finished=!0;let n=t.subarray(0,this.outputLen);this.iHash.digestInto(n),this.oHash.update(n),this.oHash.digestInto(n),this.destroy()}digest(){let t=new Uint8Array(this.oHash.outputLen);return this.digestInto(t),t}_cloneInto(t){t||(t=Object.create(Object.getPrototypeOf(this),{}));let{oHash:n,iHash:r,finished:o,destroyed:s,blockLen:i,outputLen:a,canXOF:f}=this;return t=t,t.finished=o,t.destroyed=s,t.blockLen=i,t.outputLen=a,t.canXOF=f,t.oHash=n._cloneInto(t.oHash),t.iHash=r._cloneInto(t.iHash),t}clone(){return this._cloneInto()}destroy(){this.destroyed=!0,this.oHash.destroy(),this.iHash.destroy()}},I=(()=>{let e=((t,n,r)=>new L(t,n).update(r).digest());return e.create=(t,n)=>new L(t,n),e})();var z=e=>e/2**32|0,J=e=>e>>>0;function $(e,t,n,r){let o=z(n),s=J(n);e.setUint32(t,r?s:o,r),e.setUint32(t+4,r?o:s,r)}function M(e,t,n){return e&t^~e&n}function R(e,t,n){return e&t^e&n^t&n}var E=class{constructor(t,n,r,o){c(this,"blockLen");c(this,"outputLen");c(this,"canXOF",!1);c(this,"padOffset");c(this,"isLE");c(this,"buffer");c(this,"view");c(this,"finished",!1);c(this,"length",0);c(this,"pos",0);c(this,"destroyed",!1);this.blockLen=t,this.outputLen=n,this.padOffset=r,this.isLE=o,this.buffer=new Uint8Array(t),this.view=A(this.buffer)}update(t){y(this),w(t);let{view:n,buffer:r,blockLen:o}=this,s=t.length,i=!1;for(let a=0;a<s;){let f=Math.min(o-this.pos,s-a);if(f===o){let x=A(t);for(;o<=s-a;a+=o)this.process(x,a);i=!0;continue}r.set(a===0&&f===s?t:t.subarray(a,a+f),this.pos),this.pos+=f,a+=f,this.pos===o&&(this.process(n,0),this.pos=0,i=!0)}return this.length+=t.length,i&&this.roundClean(),this}digestInto(t){y(this),m(t,this),this.finished=!0;let{buffer:n,view:r,blockLen:o,isLE:s}=this,{pos:i}=this;n[i++]=128,n.fill(0,i),this.padOffset>o-i&&(this.process(r,0),n.fill(0)),$(r,o-8,this.length*8,s),this.process(r,0),this.roundClean();let a=t===n?r:A(t),f=this.outputLen,x=f/4,b=this.get();if(f%4||x>b.length)throw new Error("invalid outputLen");for(let u=0;u<x;u++)a.setUint32(4*u,b[u],s)}digest(){let{buffer:t,outputLen:n}=this;this.digestInto(t);let r=t.slice(0,n);return this.destroy(),r}_cloneIntoMeta(t){let{buffer:n,length:r,finished:o,destroyed:s,pos:i}=this;return t.destroyed=s,t.finished=o,t.length=r,t.pos=i,i&&t.buffer.set(n),t}clone(){return this._cloneInto()}},N=Uint32Array.from([1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225]);var Y=Uint32Array.from([1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298]),l=new Uint32Array(64),T=class extends E{constructor(n,r){super(64,n,8,!1);c(this,"A",0);c(this,"B",0);c(this,"C",0);c(this,"D",0);c(this,"E",0);c(this,"F",0);c(this,"G",0);c(this,"H",0);this.A=r[0]|0,this.B=r[1]|0,this.C=r[2]|0,this.D=r[3]|0,this.E=r[4]|0,this.F=r[5]|0,this.G=r[6]|0,this.H=r[7]|0}get(){let{A:n,B:r,C:o,D:s,E:i,F:a,G:f,H:x}=this;return[n,r,o,s,i,a,f,x]}set(n,r,o,s,i,a,f,x){this.A=n|0,this.B=r|0,this.C=o|0,this.D=s|0,this.E=i|0,this.F=a|0,this.G=f|0,this.H=x|0}_cloneInto(n){return(n||(n=new this.constructor)).set(...this.get()),this._cloneIntoMeta(n)}process(n,r){for(let h=0;h<16;h++,r+=4)l[h]=n.getUint32(r,!1);for(let h=16;h<64;h++){let g=l[h-15],p=l[h-2],O=d(g,7)^d(g,18)^g>>>3,U=d(p,17)^d(p,19)^p>>>10;l[h]=U+l[h-7]+O+l[h-16]|0}let{A:o,B:s,C:i,D:a,E:f,F:x,G:b,H:u}=this;for(let h=0;h<64;h++){let g=d(f,6)^d(f,11)^d(f,25),p=u+g+M(f,x,b)+Y[h]+l[h]|0,U=(d(o,2)^d(o,13)^d(o,22))+R(o,s,i)|0;u=b,b=x,x=f,f=a+p|0,a=i,i=s,s=o,o=p+U|0}o=o+this.A|0,s=s+this.B|0,i=i+this.C|0,a=a+this.D|0,f=f+this.E|0,x=x+this.F|0,b=b+this.G|0,u=u+this.H|0,this.set(o,s,i,a,f,x,b,u)}roundClean(){H(l)}destroy(){this.destroyed=!0,this.set(0,0,0,0,0,0,0,0),H(this.buffer)}},F=class extends T{constructor(){super(32,N)}};var B=k(()=>new F,G(1));window.FCWCrypto=Object.freeze({hmacSha256(e,t){return I(B,e,t)},sha256Bytes(e){return B(e)},sha256Hex(e){return Array.from(B(e),t=>t.toString(16).padStart(2,"0")).join("")},equalBytes(e,t){if(!(e instanceof Uint8Array)||!(t instanceof Uint8Array)||e.length!==t.length)return!1;let n=0;for(let r=0;r<e.length;r++)n|=e[r]^t[r];return n===0}});})();
 </script>
 <!-- FCW_CRYPTO_END -->
 <script>
 'use strict';
 const BRIDGE_URL = 'ws://localhost:9753/plugin';
-const PROTOCOL = 2;
-const DOMAIN = 'figma-canvas-writer/v2';
+const PROTOCOL = 3;
+const DOMAIN = 'figma-canvas-writer/v3';
 const HEX64 = /^[0-9a-f]{64}$/i;
 const MAX_MSG_BYTES = 256 * 1024;
+const CHUNK_RAW_BYTES = 64 * 1024;
+const RESOURCE_BYTES = 16 * 1024 * 1024;
+const UNACKED_CHUNKS = 4;
+const TRANSFER_IDLE_MS = 30000;
+const TRANSFER_TOTAL_MS = 120000;
+const INLINE_SVG_BYTES = 128 * 1024;
 const encoder = new TextEncoder();
+const decoder = new TextDecoder('utf-8', { fatal: true });
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 let token = '';
 let cryptoKey = null;
 let context = null;
@@ -98,6 +106,8 @@ let pendingSave = false;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
 const executions = new Map();
+const outTransfers = new Map();
+let pendingImport = null;
 
 function plain(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); }
 function canonical(v) {
@@ -108,13 +118,18 @@ function canonical(v) {
 function normalizeContext(v) {
   if (!plain(v)) throw new Error('尚未取得 Figma 页面上下文');
   const out = {};
-  for (const k of ['sessionId', 'pageId', 'pageName', 'fileName']) {
-    if (typeof v[k] !== 'string' || v[k].length > 1024 || ((k === 'sessionId' || k === 'pageId') && !v[k])) throw new Error('页面上下文不合法');
-    out[k] = v[k];
+  for (const key of ['sessionId', 'runId', 'pageId', 'pageName', 'fileName', 'editorType']) {
+    if (typeof v[key] !== 'string' || v[key].length > 1024 || (key !== 'pageName' && key !== 'fileName' && !v[key])) {
+      throw new Error('页面上下文不合法: ' + key);
+    }
+    out[key] = v[key];
   }
-  if (v.editorType !== undefined) {
-    if (v.editorType !== 'figma') throw new Error('仅支持 Figma Design 文件');
-    out.editorType = v.editorType;
+  if (!['figma', 'figjam', 'slides'].includes(out.editorType)) throw new Error('不支持的编辑器类型: ' + out.editorType);
+  if (!Number.isSafeInteger(v.pageRevision) || v.pageRevision < 0) throw new Error('页面修订不合法');
+  out.pageRevision = v.pageRevision;
+  if (v.fileKey !== undefined && v.fileKey !== null) {
+    if (typeof v.fileKey !== 'string' || v.fileKey.length > 1024) throw new Error('fileKey 不合法');
+    out.fileKey = v.fileKey;
   }
   return out;
 }
@@ -135,6 +150,55 @@ async function sign(key, value) { return hex(macBytes(key, value)); }
 async function verify(key, value, mac) {
   return typeof mac === 'string' && HEX64.test(mac) && window.FCWCrypto.equalBytes(macBytes(key, value), unhex(mac)) === true;
 }
+function sha256HexOf(bytes) {
+  const digest = window.FCWCrypto.sha256Hex(bytes);
+  if (typeof digest !== 'string' || !HEX64.test(digest)) throw new Error('本地摘要组件返回格式不合法');
+  return digest;
+}
+// ---- base64 (UI thread) ----------------------------------------------------
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    const chunk = bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length));
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  let out = '';
+  for (let i = 0; i < binary.length; i += 3) {
+    const b0 = binary.charCodeAt(i);
+    const b1 = i + 1 < binary.length ? binary.charCodeAt(i + 1) : -1;
+    const b2 = i + 2 < binary.length ? binary.charCodeAt(i + 2) : -1;
+    out += B64[b0 >> 2];
+    out += B64[((b0 & 3) << 4) | (b1 >= 0 ? b1 >> 4 : 0)];
+    out += b1 >= 0 ? B64[((b1 & 15) << 2) | (b2 >= 0 ? b2 >> 6 : 0)] : '=';
+    out += b2 >= 0 ? B64[b2 & 63] : '=';
+  }
+  return out;
+}
+function base64ToBytes(value) {
+  const lookup = new Uint8Array(128);
+  for (let i = 0; i < B64.length; i++) lookup[B64.charCodeAt(i)] = i;
+  const bytes = new Uint8Array(value.length * 3 / 4);
+  let offset = 0;
+  for (let i = 0; i < value.length; i += 4) {
+    const a = lookup[value.charCodeAt(i)];
+    const b = lookup[value.charCodeAt(i + 1)];
+    const c = value.charCodeAt(i + 2) === 61 ? 255 : lookup[value.charCodeAt(i + 2)];
+    const d = value.charCodeAt(i + 3) === 61 ? 255 : lookup[value.charCodeAt(i + 3)];
+    if (a === undefined || b === undefined) throw new Error('资源编码不合法');
+    bytes[offset++] = (a << 2) | (b >> 4);
+    if (c !== 255) bytes[offset++] = ((b & 15) << 4) | (c >> 2);
+    if (d !== 255) bytes[offset++] = ((c & 3) << 6) | d;
+  }
+  return bytes.subarray(0, offset);
+}
+function concatBytes(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
+  return out;
+}
+
 function toMain(msg) { parent.postMessage({ pluginMessage: msg }, '*'); }
 function setState(state, detail) {
   const states = { idle: '已断开', waiting: '等待配对', connecting: '连接中…', connected: '正在验证本机桥接…', authorized: '已授权', auth_failed: '连接未获授权', disconnected: '已断开，等待重连…' };
@@ -151,9 +215,12 @@ function detach(reason) {
   connection = null;
   generation++;
   executions.clear();
+  outTransfers.clear();
+  pendingImport = null;
   if (c) {
     c.authed = false;
     clearTimeout(c.authTimer);
+    for (const timer of Object.values(c.transferTimers || {})) clearTimeout(timer);
     try { c.ws.close(1000, reason || 'disconnect'); } catch {}
   }
 }
@@ -177,7 +244,7 @@ async function setKey(value, save) {
   const rev = ++keyRevision;
   if (!HEX64.test(value)) throw new Error('配对密钥必须是 64 位十六进制字符');
   if (typeof globalThis.crypto?.getRandomValues !== 'function') throw new Error('当前环境缺少安全随机数，已拒绝建立连接');
-  if (typeof window.FCWCrypto?.hmacSha256 !== 'function' || typeof window.FCWCrypto?.equalBytes !== 'function') throw new Error('本地签名组件未加载，请重新导入完整插件');
+  if (typeof window.FCWCrypto?.hmacSha256 !== 'function' || typeof window.FCWCrypto?.sha256Hex !== 'function' || typeof window.FCWCrypto?.equalBytes !== 'function') throw new Error('本地签名组件未加载，请重新导入完整插件');
   const imported = unhex(value);
   if (rev !== keyRevision) return;
   token = value.toLowerCase();
@@ -194,7 +261,7 @@ function connect() {
   const c = {
     generation: ++generation, key: cryptoKey, context: { ...context }, authed: false,
     serverNonce: null, clientNonce: null, connectionId: null, recvSeq: 0, sendSeq: 0,
-    receiveQueue: Promise.resolve(), sendQueue: Promise.resolve(),
+    receiveQueue: Promise.resolve(), sendQueue: Promise.resolve(), transferTimers: {},
   };
   connection = c;
   setState('connecting', context.fileName + ' / ' + context.pageName);
@@ -209,7 +276,7 @@ function connect() {
       if (!plain(msg)) throw new Error('桥接消息不合法');
       if (!c.authed) {
         if (msg.type === 'challenge' && !c.serverNonce) {
-          if (msg.protocol !== PROTOCOL || typeof msg.serverNonce !== 'string' || !HEX64.test(msg.serverNonce)) throw new Error('桥接协议不匹配');
+          if (msg.protocol !== PROTOCOL || typeof msg.serverNonce !== 'string' || !HEX64.test(msg.serverNonce)) throw new Error('桥接协议不匹配，请更新桥接与插件到同一版本');
           c.serverNonce = msg.serverNonce;
           c.clientNonce = hex(crypto.getRandomValues(new Uint8Array(32)));
           const proof = await sign(c.key, authProof('client-auth', c.serverNonce, c.clientNonce, c.context));
@@ -238,15 +305,35 @@ function connect() {
       if (!current(c) || !c.authed) return;
       c.recvSeq = msg.seq;
       const p = msg.payload;
+      if (p.type === 'chunk') {
+        await receiveChunk(c, p);
+        return;
+      }
+      if (p.type === 'chunk_ack') {
+        receiveChunkAck(c, p);
+        return;
+      }
       if (p.type !== 'cmd' || typeof p.id !== 'string' || !p.id ||
           p.sessionId !== c.context.sessionId || p.pageId !== c.context.pageId ||
+          p.pageRevision !== c.context.pageRevision ||
           typeof p.command !== 'string' || !plain(p.params) || executions.has(p.id) ||
-          Object.keys(p).some(k => !['type', 'id', 'sessionId', 'pageId', 'operationId', 'command', 'params'].includes(k))) throw new Error('命令目标或格式不合法');
-      if (['createNode', 'modifyNode', 'deleteNode', 'setText'].includes(p.command) &&
-          (typeof p.operationId !== 'string' || !p.operationId || p.operationId.length > 128)) throw new Error('写入缺少 operationId');
+          Object.keys(p).some(k => !['type', 'id', 'sessionId', 'pageId', 'pageRevision', 'operationId', 'command', 'params'].includes(k))) throw new Error('命令目标或格式不合法');
       if (executions.size >= 100) throw new Error('在途命令数量过多');
+      if (p.command === 'importAsset') {
+        if (typeof p.operationId !== 'string' || !p.operationId || p.operationId.length > 128) throw new Error('导入缺少 operationId');
+        if (typeof p.params.transferId !== 'string' || typeof p.params.totalBytes !== 'number' || typeof p.params.totalSha256 !== 'string') throw new Error('导入传输参数不合法');
+        if (pendingImport) throw new Error('已有未完成的导入传输');
+        pendingImport = {
+          id: p.id, sessionId: p.sessionId, pageId: p.pageId, pageRevision: p.pageRevision,
+          operationId: p.operationId, params: { ...p.params },
+          transferId: p.params.transferId, totalBytes: p.params.totalBytes, totalSha256: p.params.totalSha256,
+          chunks: [], received: 0, nextIndex: 0,
+        };
+        c.transferTimers['import-' + p.id] = setTimeout(() => { if (pendingImport && pendingImport.id === p.id) { pendingImport = null; fail(c, '导入传输无进展'); } }, TRANSFER_IDLE_MS);
+        return;
+      }
       executions.set(p.id, c);
-      toMain({ type: 'exec', id: p.id, sessionId: p.sessionId, pageId: p.pageId,
+      toMain({ type: 'exec', id: p.id, sessionId: p.sessionId, pageId: p.pageId, pageRevision: p.pageRevision,
         ...(p.operationId === undefined ? {} : { operationId: p.operationId }), command: p.command, params: p.params });
     }).catch(e => fail(c, e.message));
   };
@@ -257,26 +344,130 @@ function connect() {
     connection = null;
     generation++;
     executions.clear();
+    outTransfers.clear();
+    pendingImport = null;
     c.authed = false;
     if (wantConnected) { setState('disconnected', '桥接断开；写入超时后请查询原 operationId'); scheduleReconnect(); }
   };
+}
+
+// ---- inbound chunks (bridge -> plugin, import only) ------------------------
+async function receiveChunk(c, p) {
+  if (!pendingImport) throw new Error('收到未声明的分块');
+  if (p.transferId !== pendingImport.transferId) throw new Error('分块属于其他传输');
+  if (p.index !== pendingImport.nextIndex) throw new Error('分块乱序，已断开');
+  if (typeof p.data !== 'string') throw new Error('分块数据不合法');
+  const bytes = base64ToBytes(p.data);
+  if (bytes.length > CHUNK_RAW_BYTES) throw new Error('分块超过 64KiB');
+  pendingImport.received += bytes.length;
+  if (pendingImport.received > RESOURCE_BYTES) throw new Error('导入资源超过 16MiB');
+  pendingImport.chunks.push(bytes);
+  pendingImport.nextIndex++;
+  clearTimeout(c.transferTimers['import-' + pendingImport.id]);
+  c.transferTimers['import-' + pendingImport.id] = setTimeout(() => { if (pendingImport) { pendingImport = null; fail(c, '导入传输无进展'); } }, TRANSFER_IDLE_MS);
+  await sendSigned(c, { type: 'chunk_ack', transferId: p.transferId, index: p.index });
+  if (p.done !== true) return;
+  const raw = concatBytes(pendingImport.chunks);
+  if (raw.length !== pendingImport.totalBytes) throw new Error('导入资源字节数不符');
+  if (sha256HexOf(raw) !== pendingImport.totalSha256) throw new Error('导入资源哈希不符');
+  const pending = pendingImport;
+  pendingImport = null;
+  clearTimeout(c.transferTimers['import-' + pending.id]);
+  if (!executions.has(pending.id)) {
+    executions.set(pending.id, c);
+    toMain({ type: 'import_asset_request', id: pending.id, sessionId: pending.sessionId, pageId: pending.pageId,
+      pageRevision: pending.pageRevision, operationId: pending.operationId,
+      params: { ...pending.params, assetBase64: bytesToBase64(raw) } });
+  }
+}
+
+// ---- outbound chunks (plugin -> bridge, export/upload) ---------------------
+function startUpload(c, msg) {
+  if (!msg.transferId || typeof msg.data !== 'string') throw new Error('上传参数不合法');
+  const raw = base64ToBytes(msg.data);
+  if (raw.length !== msg.totalBytes) throw new Error('上传字节数不符');
+  if (raw.length > RESOURCE_BYTES) throw new Error('上传资源超过 16MiB');
+  const chunkCount = raw.length === 0 ? 1 : Math.ceil(raw.length / CHUNK_RAW_BYTES);
+  const transfer = {
+    id: msg.id, transferId: msg.transferId, operationId: msg.operationId || null,
+    totalBytes: raw.length, sha: sha256HexOf(raw), chunkCount,
+    chunks: [], sent: 0, unacked: new Set(), finished: false,
+  };
+  for (let index = 0; index < chunkCount; index++) {
+    const slice = raw.subarray(index * CHUNK_RAW_BYTES, Math.min((index + 1) * CHUNK_RAW_BYTES, raw.length));
+    transfer.chunks.push(slice);
+  }
+  outTransfers.set(msg.transferId, transfer);
+  c.transferTimers['out-' + msg.transferId] = setTimeout(() => {
+    const t = outTransfers.get(msg.transferId);
+    if (t && !t.finished) { outTransfers.delete(msg.transferId); toMain({ type: 'transfer_upload_done', id: t.id, ok: false, error: '上传传输无进展' }); }
+  }, TRANSFER_IDLE_MS);
+  pumpOutbound(c, transfer);
+}
+function pumpOutbound(c, transfer) {
+  if (!current(c) || !c.authed || c.ws.readyState !== 1) return;
+  while (transfer.sent < transfer.chunkCount && transfer.unacked.size < UNACKED_CHUNKS) {
+    const index = transfer.sent++;
+    const isLast = index === transfer.chunkCount - 1;
+    const payload = {
+      type: 'chunk', transferId: transfer.transferId, index, done: isLast,
+      data: bytesToBase64(transfer.chunks[index]),
+      ...(index === 0 ? { operationId: transfer.operationId, totalBytes: transfer.totalBytes, totalSha256: transfer.sha } : {}),
+    };
+    transfer.unacked.add(index);
+    sendSigned(c, payload).catch(() => {});
+    if (index === 0) {
+      c.transferTimers['total-' + transfer.transferId] = setTimeout(() => {
+        const t = outTransfers.get(transfer.transferId);
+        if (t && !t.finished) { outTransfers.delete(transfer.transferId); toMain({ type: 'transfer_upload_done', id: t.id, ok: false, error: '上传传输总时长超限' }); }
+      }, TRANSFER_TOTAL_MS);
+    }
+  }
+  if (transfer.sent === transfer.chunkCount && transfer.unacked.size === 0 && !transfer.finished) {
+    transfer.finished = true;
+    outTransfers.delete(transfer.transferId);
+    clearTimeout(c.transferTimers['out-' + transfer.transferId]);
+    clearTimeout(c.transferTimers['total-' + transfer.transferId]);
+    toMain({ type: 'transfer_upload_done', id: transfer.id, ok: true });
+  }
+}
+function receiveChunkAck(c, p) {
+  const transfer = outTransfers.get(p.transferId);
+  if (!transfer) return;
+  if (typeof p.index !== 'number' || !Number.isSafeInteger(p.index)) throw new Error('上传确认序号非法');
+  if (!transfer.unacked.has(p.index)) return;
+  transfer.unacked.delete(p.index);
+  clearTimeout(c.transferTimers['out-' + transfer.transferId]);
+  c.transferTimers['out-' + transfer.transferId] = setTimeout(() => {
+    const t = outTransfers.get(transfer.transferId);
+    if (t && !t.finished) { outTransfers.delete(transfer.transferId); toMain({ type: 'transfer_upload_done', id: t.id, ok: false, error: '上传传输无进展' }); }
+  }, TRANSFER_IDLE_MS);
+  pumpOutbound(c, transfer);
+}
+async function sendSigned(c, payload) {
+  await c.sendQueue;
+  return new Promise((resolve, reject) => {
+    c.sendQueue = (async () => {
+      if (!current(c) || !c.authed || c.ws.readyState !== 1) { reject(new Error('连接不可用')); return; }
+      try {
+        const seq = ++c.sendSeq;
+        const frame = { type: 'frame', connectionId: c.connectionId, seq, payload,
+          mac: await sign(c.key, frameProof('client', c.connectionId, seq, payload)) };
+        const text = JSON.stringify(frame);
+        if (encoder.encode(text).length > MAX_MSG_BYTES) throw new Error('插件消息超过 256KB');
+        if (current(c) && c.authed && c.ws.readyState === 1) c.ws.send(text);
+        resolve();
+      } catch (e) { reject(e); throw e; }
+    })().catch(e => fail(c, e.message));
+  });
 }
 function sendResult(msg) {
   const c = executions.get(msg.id);
   executions.delete(msg.id);
   if (!c || !current(c) || !c.authed || c.ws.readyState !== 1) return;
-  c.sendQueue = c.sendQueue.then(async () => {
-    if (!current(c) || !c.authed || c.ws.readyState !== 1) return;
-    const payload = msg.ok === true
-      ? { type: 'resp', id: msg.id, ok: true, data: msg.data === undefined ? null : msg.data }
-      : { type: 'resp', id: msg.id, ok: false, error: msg.error || { code: 'PLUGIN_ERROR', message: '插件未提供错误详情' } };
-    const seq = ++c.sendSeq;
-    const frame = { type: 'frame', connectionId: c.connectionId, seq, payload,
-      mac: await sign(c.key, frameProof('client', c.connectionId, seq, payload)) };
-    const text = JSON.stringify(frame);
-    if (encoder.encode(text).length > MAX_MSG_BYTES) throw new Error('插件结果超过 256KB，请缩小读取范围并查询在途写入状态');
-    if (current(c) && c.authed && c.ws.readyState === 1) c.ws.send(text);
-  }).catch(e => fail(c, e.message));
+  sendSigned(c, msg.ok === true
+    ? { type: 'resp', id: msg.id, ok: true, data: msg.data === undefined ? null : msg.data }
+    : { type: 'resp', id: msg.id, ok: false, error: msg.error || { code: 'PLUGIN_ERROR', message: '插件未提供错误详情' } }).catch(() => {});
 }
 
 window.onmessage = event => {
@@ -285,6 +476,12 @@ window.onmessage = event => {
   const msg = event.data?.pluginMessage;
   if (!plain(msg)) return;
   if (msg.type === 'exec_result') { sendResult(msg); return; }
+  if (msg.type === 'transfer_upload') {
+    if (!connection || !connection.authed || connection.ws.readyState !== 1) { toMain({ type: 'transfer_upload_done', id: msg.id, ok: false, error: '连接不可用' }); return; }
+    try { startUpload(connection, msg); }
+    catch (e) { toMain({ type: 'transfer_upload_done', id: msg.id, ok: false, error: e.message }); }
+    return;
+  }
   if (msg.type === 'init' || msg.type === 'context') {
     try {
       const next = normalizeContext(msg.context);

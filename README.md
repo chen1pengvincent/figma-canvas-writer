@@ -1,22 +1,24 @@
-# Figma Canvas Writer
+# Figma Canvas Writer 3
 
-通过本机 MCP stdio，把 Agent 的工具调用转交给 Figma Design 插件，在用户当前页面执行受限的读取、创建、修改和删除。此版本采用**一个 Agent 进程连接一个插件实例**；适用于能启动本地 stdio 服务、且与本项目协议版本兼容的宿主。
+通过本机 MCP stdio，把 Agent 的工具调用转交给 Figma 插件，在**经用户逐次授权的画布会话**内执行受限的读取、创建、修改、资源进出与结构化验收。此版本采用**一个 Agent 进程连接一个插件实例**；适用于能启动本地 stdio 服务、且与本协议（版本 3）兼容的宿主。
 
-项目使用 Figma [Plugin API](https://developers.figma.com/docs/plugins/api/api-reference/) 操作画布。插件能力以本项目的工具清单为准；不要求 Dev Mode，也不等同于开放全部 Plugin API。桥接有一个运行时依赖 `ws`，确切版本由已提交的 `bridge/package-lock.json` 锁定。
+v3 相比 v2 的核心扩展：工具从 9 个增加到 **37 个**，新增语义查询与续读、页面管理、资源导入导出（分块传输 + 本机产物）、层级/矢量/布局/富文本区间/视觉属性编辑、变量/样式/组件/库发现导入、原型 reactions、有限批量（batch）、Motion/MP4 导出作业、Shader 只读发现，并扩展支持 **FigJam 与 Slides 编辑器**。逐工具清单见下文；与官方 Figma MCP 的能力差距见 [`MIGRATION.md`](MIGRATION.md) 与下方"能力边界"。
+
+项目使用 Figma [Plugin API](https://developers.figma.com/docs/plugins/api/api-reference/) 操作画布。插件能力以本项目工具清单为准；不要求 Dev Mode，也不等同于开放全部 Plugin API。桥接运行时依赖只有 `ws`（版本由 `bridge/package-lock.json` 锁定）。
 
 ```text
 本机 Agent → MCP stdio → Node 桥接 → ws://localhost:9753/plugin
-                                           ↕ 双向鉴权与逐帧签名
-                                      Figma 插件 UI
+                                           ↕ 协议 3：双向鉴权 + 逐帧签名
+                                      Figma 插件 UI（分块资源通道）
                                            ↕
-                                  当前 Design 页面 Plugin API
+                              当前文档/页面的 Plugin API（Design / FigJam / Slides）
 ```
 
 ## 安装与首次配对
 
-准备 Node.js **20 或以上（包含 npm）**、Figma Desktop，以及一个有编辑权限的 Design 文件。插件 UI 需要 `crypto.getRandomValues` 提供安全随机数，不依赖 Figma iframe 中可能缺失的 `crypto.subtle`。
+准备 Node.js **20 或以上（包含 npm）**、Figma Desktop，以及一个有编辑权限的文件。插件 UI 需要 `crypto.getRandomValues` 提供安全随机数。
 
-1. 获取项目并安装依赖。Windows、macOS、Linux 共用 Node 安装入口：
+1. 获取项目并安装依赖（Windows、macOS、Linux 共用）：
 
    ```sh
    git clone https://github.com/chen1pengvincent/figma-canvas-writer.git
@@ -24,133 +26,126 @@
    node install.mjs
    ```
 
-   macOS/Linux 也可使用 `bash install.sh`。安装器每次执行 `npm ci --omit=dev --ignore-scripts --no-audit --no-fund`，按 lockfile 重建运行时依赖并检查本地 `ws` 可加载；残缺的 `node_modules` 不会被当作安装成功。发布的 `plugin/ui.html` 已内联固定版本的加密实现，普通安装省略开发依赖，无需本地构建或执行依赖安装脚本；插件不从网络加载加密代码。
+   macOS/Linux 也可使用 `bash install.sh`。安装器每次执行 `npm ci --omit=dev --ignore-scripts --no-audit --no-fund` 重建运行时依赖并检查本地 `ws` 可加载。发布的 `plugin/code.js` 与 `plugin/ui.html` 是已构建/已内联的产物，普通安装零构建、不执行依赖安装脚本、不从网络加载代码。
 
-2. 从 **`generated-config/`** 选择一个宿主示例，将服务条目合并到现有 MCP 配置，保留其他配置。生成文件已填入本机 Node 和桥接的绝对路径，支持含空格路径；安装器不会修改用户配置或启动服务。仓库内的 [`config-examples/`](config-examples/README.md) 是可移植的占位符示例。
+2. 从 **`generated-config/`** 选择宿主示例，把服务条目合并进现有 MCP 配置。生成文件已填入本机 Node 与桥接的绝对路径；安装器不修改用户配置、不启动服务。可移植占位示例在 [`config-examples/`](config-examples/README.md)。
 
-3. 在该 Agent 中启动或重新加载 MCP 服务。桥接由 Agent 启动，插件连接固定端点 `ws://localhost:9753/plugin`。桥接分别显式监听 `127.0.0.1:9753` 和 `[::1]:9753`，两个回环地址共享同一套认证，不绑定 `0.0.0.0` 或 `::` 通配地址。同一时刻只启动一个实例。
+3. 在 Agent 中启动/重载 MCP 服务。桥接由 Agent 启动，插件连接固定端点 `ws://localhost:9753/plugin`；分别显式监听 `127.0.0.1:9753` 与 `[::1]:9753`，不绑定通配地址。同一时刻只运行一个桥接、授权一个插件。
 
-4. 在仓库根目录的本机终端显式显示配对密钥：
+4. 本机终端显式显示配对密钥：
 
    ```sh
    node bridge/mcp-bridge.js --show-pairing-key
    ```
 
-   将输出的 **64 位十六进制密钥（256 bit）**复制到插件面板。此命令只显示密钥后退出，不会启动另一份桥接。密钥不应放进 Agent 配置、提示词或 MCP 工具参数。
+   把输出的 **64 位十六进制密钥（256 bit）**粘贴到插件面板。该命令只显示密钥后退出；密钥不进入 Agent 配置、提示词或工具参数。**从 v2 升级可沿用原密钥**（见 [`MIGRATION.md`](MIGRATION.md)）。
 
-5. 在 Figma Desktop 的插件开发菜单中选择 **Import plugin from manifest**，导入 `plugin/manifest.json`。打开有编辑权限的 Design 文件，运行 **Figma Canvas Writer 2**，粘贴密钥并连接。若开发插件列表中还保留旧版 **Figma Canvas Writer**，请按带 **2** 的名称选择本版本。插件保存配对信息后可在下次运行时使用。
+5. 在 Figma Desktop 插件开发菜单选择 **Import plugin from manifest** 导入 `plugin/manifest.json`，打开有编辑权限的文件并运行 **Figma Canvas Writer 3**，粘贴密钥连接。v3 同时在 Design、FigJam、Slides 文件中可用；本插件为普通插件（非 Dev Mode），`teamlibrary` 权限仅用于库发现/按 key 导入。
 
-6. 让 Agent 调用 `figma_canvas_status`，确认返回的 `data.authorized` 为 `true`，核对 `data.context` 中的文件名与页面名。随后使用其中的 `sessionId` 和 `pageId` 读取当前页面；先在专用测试页面验证一次创建、回读和删除，再用于实际工作。
-
-这些步骤完成了本地授权与连通性检查；只有在目标客户端和真实 Figma 文件中完成读写回读，才能确认该组合已可用。
+6. 让 Agent 调用 `figma_canvas_status`，确认 `data.authorized === true`，核对 `data.context`（文件名、页面名、`editorType`）。**之后所有目标工具都要求 `sessionId`、`pageId`、`pageRevision`**——三者都来自最新一次状态读取；切页（手动或工具）后必须重新读取。
 
 ## 工具与调用约定
 
-所有工具返回 MCP 文本内容，文本中是 JSON。业务成功时为 `{ "ok": true, "data": ... }`；执行失败时为 `{ "ok": false, "error": ... }` 并设置 `isError: true`。协议错误另以 JSON-RPC error 返回。
+所有工具返回 MCP 文本内容（JSON）。业务成功 `{ "ok": true, "data": ... }`；执行失败 `{ "ok": false, "error": ... }` 且 `isError: true`。
 
-| 工具 | 用途 |
-|---|---|
-| `figma_canvas_status` | 检查连接、鉴权和真实插件响应，取得当前文件、页面及会话上下文 |
-| `figma_get_context` | 分页读取当前页面的顶层节点 |
-| `figma_get_selection` | 分页读取当前选择的节点 |
-| `figma_get_node` | 按 ID 读取节点属性与有限深度的子节点 |
-| `figma_get_operation` | 查询指定写操作的状态与已记录结果 |
-| `figma_create_node` | 创建 RECTANGLE、ELLIPSE、TEXT、FRAME、LINE 或 STAR |
-| `figma_modify_node` | 修改白名单中的节点属性 |
-| `figma_delete_node` | 删除指定节点 |
-| `figma_set_text` | 修改文本、字体、字号或位置；省略 `text` 时保留原文 |
+**调用约定（v3）**：除 `figma_canvas_status` 与 `figma_read_asset` 外，所有工具必填 `sessionId` + `pageId` + `pageRevision`（**新增必填，破坏性变更**）。写类工具另必填 `operationId`（每次新写入唯一，相同 ID + 相同计划复用原结果，不同计划返回 `OPERATION_CONFLICT`）。混合分类工具（variables/styles/components/libraries/textRange/motion/figjam/slides）仅在调用写动作时要求 `operationId`。
 
-除 `figma_canvas_status` 外，所有工具都要求从最新状态取得的 **`sessionId`、`pageId`**。四个写工具另外要求 **`operationId`**，由调用方为每次新写入生成唯一值，例如 UUID。`sessionId` 用来定位插件运行会话，不是认证密钥。
-
-创建示例（以下是 `figma_create_node` 的参数，替换会话与页面值后使用）：
-
-```json
-{
-  "sessionId": "从当前状态复制",
-  "pageId": "从当前状态复制",
-  "operationId": "6e91e2b0-1e81-4968-a2ee-a52c1277c5b1",
-  "type": "RECTANGLE",
-  "name": "连接验收矩形",
-  "x": 0,
-  "y": 0,
-  "width": 100,
-  "height": 80
-}
-```
-
-用返回的节点 ID 调用 `figma_get_node` 回读；删除时使用另一个新的 `operationId`。创建 TEXT 必须显式提供 `text`，允许空字符串。可修改的属性为 `name`、`x`、`y`、`width`、`height`、`rotation`（度）、`opacity`、`visible`、`fills`、`strokes`、`strokeWeight`、`cornerRadius`，实际适用性还取决于节点类型。
-
-页面或插件会话发生变化后，重新读取状态并确认目标。此版本只操作当前页面，不自动切页，也不接受其他文件或其他页面的节点作为目标。
+| 领域 | 工具 | 说明 |
+|---|---|---|
+| 状态 | `figma_canvas_status` | 连接/鉴权状态与当前上下文（含 pageRevision） |
+| 能力 | `figma_get_capabilities` | 逐域实现状态、前置条件、限额、`verified` 标志 |
+| 基础读 | `figma_get_context` / `figma_get_selection` / `figma_get_node` | 分页读取当前页顶层/选区；节点摘要 + 有限深度 |
+| 语义读 | `figma_query_nodes` | 类型/名称受限条件 + 字段投影 + 分页；续读游标固定成员列表 |
+| | `figma_get_children` | 容器子节点续读；成员列表创建时固定，移除成员标记 `expired` |
+| | `figma_read_field` | 多节点字段读取；区分 `absent/mixed/unsupported/truncated` |
+| | `figma_get_text_runs` | 文本样式分段 + 正文分块；UTF-16 边界安全；内容变化使游标失效 |
+| | `figma_get_design_context` | 结构化设计上下文（布局/文字/组件/变量/样式/资源） |
+| 操作对账 | `figma_get_operation` | 查询写操作/作业真实状态；**切页后仍可对账**（仅需 sessionId 有效） |
+| 页面 | `figma_list_pages` / `figma_manage_page` | 列表、创建、重命名、删除（显式 confirm）、切页（独立上下文操作，完成后重新读取状态） |
+| 资源 | `figma_get_screenshot` | 节点 PNG 截图；≤128KiB 内联 data URL，否则落产物 |
+| | `figma_export_asset` | PNG/JPG/SVG/PDF 导出到 `~/.figma-canvas-writer/artifacts/`（排他创建、SHA-256 校验） |
+| | `figma_import_asset` | 本机 PNG/JPEG → 持久图片填充；SVG（有界解析子集）→ 可编辑矢量；不接受 URL |
+| | `figma_read_asset` | 产物元数据（路径/字节/SHA-256/MIME）；小产物含内联预览 |
+| 编辑 | `figma_create_node` / `figma_modify_node` / `figma_delete_node` / `figma_set_text` | 与 v2 语义一致的受限编辑 |
+| | `figma_hierarchy` | clone / group / ungroup / reparent（绝对或局部坐标）/ reorder；拒绝循环层级 |
+| | `figma_vector` | 多边形、矢量路径、布尔运算（union/subtract/intersect/exclude）、形状参数、vectorNetwork |
+| | `figma_layout` | Auto Layout、间距、内边距、对齐、尺寸模式、约束 |
+| | `figma_text_range` | 字符区间样式读写；字体加载失败不静默替换 |
+| | `figma_visual` | effects、混合、裁切、遮罩、网格、描边细节、分角圆角 |
+| 设计系统 | `figma_variables` | 本地变量集合/变量/模式/值/别名/绑定/解析 |
+| | `figma_styles` | 本地 Paint/Text/Effect/Grid 样式查询、创建、修改、应用 |
+| | `figma_components` | 组件/变体/实例创建、属性、swap、detach、属性管理 |
+| | `figma_libraries` | 已启用库的变量集合发现 + 按已知 key 导入变量/组件/样式（需 `teamlibrary` 权限且用户已启用库） |
+| 原型批量 | `figma_set_reactions` | 设置/清除原型 reactions 与起始节点 |
+| | `figma_batch` | ≤50 步顺序执行、前序结果引用（`step{n}.id`）、失败默认停止并返回逐项状态 |
+| 动画 | `figma_motion` | 动画样式发现、节点时间线/关键帧轨道读写 |
+| | `figma_export_video` | 顶层动画 Frame → MP4（作业：accepted → 轮询 `figma_get_operation` → 产物） |
+| | `figma_shaders` | 可用 Shader 列表与可读公开配置（只读，不导入不应用） |
+| 专用编辑器 | `figma_figjam` | FigJam：便笺、带字形状、连接线、列表读取（仅 FigJam 文件） |
+| | `figma_slides` | Slides：结构读取、幻灯片/行创建、内容节点（仅 Slides 文件） |
 
 ### 超时、失败与重复调用
 
-插件串行执行读写；同一插件运行会话内，相同 `operationId` 和相同参数返回原操作结果，不再次执行。将同一 ID 用于不同参数会返回冲突错误。
+写操作串行执行；相同 `operationId` + 相同计划复用原结果。超时/断线后写入可能已发生：**先用原参数调 `figma_get_operation` 对账**（切页后依然可用），再决定下一步；不要换 ID 盲目重发。`partial` 表示可能部分修改；`unknown` 表示结果未知。批量失败默认停止，逐项状态在 `error.details.steps` 与对账记录中。
 
-超时、断线或取消后，写入可能已经发生。先用原 `sessionId`、`pageId`、`operationId` 调用 `figma_get_operation`，查询 `queued`、`running`、`succeeded`、`failed`、`partial`、`unknown` 或 `not_found` 状态，并回读涉及的节点。**不要换一个 ID 盲目重发结果未知的写入。** `partial` 表示可能存在部分修改，不承诺所有失败都会原子回滚。
+### 读取与资源边界
 
-操作记录只保留在本次插件运行的内存中；重开插件后不能凭 `not_found` 推断此前没有写入。记录达到容量限制时会拒绝新写入，先对账，再重开插件。Figma 撤销操作仍由用户控制；本项目不保证每条工具调用都对应一个独立撤销步骤。
+- 分页默认 50/页、上限 100；`figma_query_nodes`/`figma_get_children` 的续读游标绑定会话与页面，TTL 120 秒，最多 16 个活动句柄。
+- 资源通道：单块 64KiB（签名帧内）、单资源 16MiB、并发 2、4 块确认窗口、SHA-256 完整性校验；产物目录 `~/.figma-canvas-writer/artifacts/`（排他创建、不覆盖、不自动清理）。
+- 导入路径限用户主目录或 `FIGMA_IMPORT_DIR` 指定目录内的普通文件；校验真实路径、文件头与扩展名一致性；不跟随越界符号链接。
 
-### 大页面与读取范围
+## 能力边界（与官方 Figma 集成的差距）
 
-`figma_get_context` 和 `figma_get_selection` 使用 `cursor`、`limit` 分页，默认每页 50 个、最多 100 个。按返回的 `nextCursor` 继续读取，直到为 `null`。`figma_get_node` 的 `depth` 为 0–6 的整数，节点树有数量上限；读取结果以 `childrenCount`、`truncated`、`charactersTruncated` 等字段标明省略内容。不要把截断结果当作完整页面。
+v3 定位是**本地 MCP 能力补齐**，不是官方 27 项对照的等价实现。明确的差距：不生成业务/框架代码、不做 Code Connect、不接 Figma REST/Remote MCP、不做网页捕获、不支持 Make/Weave、不新建 Figma 文件、不发布团队库。本地子集边界（如 SVG 解析子集、Slides 内容类型限制、Shader 只读）见各工具描述与 `figma_get_capabilities` 返回。
 
-组件库、变量、样式管理、Auto Layout 专用操作、任意代码执行、跨文件操作均不在当前工具范围内。
+**验收状态声明**：229 项自动化测试全部通过（真实 stdio/WS 协议 + 严格插件 fixture + 完整性反例）。**真实 Figma 画布验收（跨页、资源往返、设计系统、原型点击、FigJam/Slides、MP4 解码、真实 Shader 样本）记录在 [`MIGRATION.md`](MIGRATION.md) 附带的对账摘要中；未通过真实验收的能力一律不得当作已验收。**
 
 ## 本地授权与恢复
 
-配对使用本机生成的 256 bit 密钥。双方通过 HMAC 证明持有密钥；后续消息绑定连接、方向和递增序号并签名，以拒绝篡改与重放。**密钥不通过 WebSocket 下发**，首次配对由用户在本机终端显式显示后粘贴到插件。HMAC 提供鉴权与完整性，不加密画布消息；连接限定为本机回环。
+配对使用本机生成的 256 bit 密钥；HMAC 双向证明持有密钥，后续消息绑定连接、方向与递增序号签名，拒绝篡改与重放。**密钥不通过 WebSocket 下发**。桥接配置目录优先级：`FIGMA_BRIDGE_HOME` → 旧目录 `~/.dsh-figma-bridge` → 默认 `~/.figma-canvas-writer`。
 
-桥接配置目录按以下优先级选择：显式设置的 `FIGMA_BRIDGE_HOME` → 已存在的旧目录 `~/.dsh-figma-bridge` → 默认目录 `~/.figma-canvas-writer`。密钥保存在所选目录的 `bridge-token` 文件中；保留旧目录优先级可在升级时沿用已有密钥。插件端保存在 Figma `clientStorage`。Agent 启动、显示密钥、轮换密钥必须使用同一个目录。本机同一账户下能读取该密钥的进程处于同一信任边界。
-
-- **临时停用**：在插件中断开连接，或停止 Agent 的 MCP 服务。stdio 关闭后桥接退出并释放端口；重新启用时重新核对上下文。
-- **忘记当前插件配对**：使用插件中的忘记配对操作，清除插件保存的密钥，再按安装步骤配对。
-- **撤销旧密钥**：先停止占用端口的桥接，再执行以下命令。命令成功后退出；随后重启 Agent 服务、显示新密钥，并让插件忘记旧配对。
+- **临时停用**：插件中断开连接，或停止 Agent 的 MCP 服务。
+- **忘记插件配对**：插件内"忘记配对"后重新粘贴密钥。
+- **吊销旧密钥**：
 
   ```sh
   node bridge/mcp-bridge.js --rotate-token
   ```
 
-  若 `9753` 已被占用，轮换失败且不会修改密钥。仅清除插件保存的配对不会吊销其他持有同一密钥的副本；需要吊销时应轮换。
+  9753 被占用时轮换失败且不修改密钥。撤销授权（revoke）会同时清空操作记录与读取游标：旧 `operationId` 不再可查询，也不会泄露操作存在性。
 
-审计日志为配置目录内的 `audit.log`，记录工具名、会话、页面、操作 ID、耗时与结果，不记录完整画布文本或密钥。Unix 权限位用于限制本机文件访问；不以此声称已完成 Windows ACL 验证。
+审计日志为配置目录 `audit.log`：只记录工具名、会话/页面/操作 ID、耗时与结果，不记录画布文本或密钥。
 
 ## 兼容性与排障
 
-本项目实现本机 MCP stdio，并协商 `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25` 协议版本。按照 [MCP 生命周期规范](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle)，客户端还需支持协商结果并完成初始化。提供配置示例不等于所有 Agent 已通过实际连接验证。
-
-当前不提供远程 MCP HTTP/SSE 服务、多 Agent 并发、多个插件并发或自定义端口。客户端示例与实际验收状态见 [`config-examples/README.md`](config-examples/README.md)。
+实现本机 MCP stdio，协商 `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25` 协议版本。**协议 3 与 v2 的协议 2 互不兼容：桥接与插件必须成套升级**（旧插件对 v3 桥接握手即败，反之亦然）。从 v2 迁移见 [`MIGRATION.md`](MIGRATION.md)。
 
 | 现象 | 处理 |
 |---|---|
-| 安装找不到 Node 或 npm | 安装包含 npm 的 Node.js >=20，再运行 `node install.mjs` |
-| npm ci 失败或依赖缺失 | 依据原始 npm 错误修复网络/文件问题后重跑；安装器会重建依赖 |
-| 仓库移动或 Node 绝对路径变化 | 重跑安装器，使用新生成的配置更新该服务条目 |
-| 9753 端口已占用 | 停止另一份 Agent 桥接；不要通过修改端口环境变量绕过 |
-| 插件未连接或鉴权失败 | 先确认 Agent 桥接已启动，检查配置目录一致，再忘记旧配对并使用当前密钥 |
-| `crypto.getRandomValues` 不可用 | 当前 Figma UI 环境无法安全生成认证随机数；使用支持该 API 的环境后重试 |
-| `STALE_CONTEXT`、`SESSION_CHANGED`、`PAGE_CHANGED` | 重新读取状态与目标页面，确认后发起操作 |
-| 写入超时、断线、`partial`、`unknown` | 查询原操作 ID 并回读节点，完成对账后再决定下一步 |
+| 安装找不到 Node/npm | 安装 Node.js >= 20 后重跑 `node install.mjs` |
+| 9753 端口被占用 | 停止另一份桥接；不要改端口环境变量绕过 |
+| 插件协议不匹配 | 桥接与插件版本不一致；成套升级到 3.0.0 |
+| `STALE_CONTEXT` | 重新 `figma_canvas_status`，用新 `sessionId/pageId/pageRevision` 重试 |
+| `PAGE_CHANGED` / `SESSION_CHANGED` | 页面或会话已变化；重新读取状态确认目标 |
+| 写入超时/断线/partial/unknown | 用原 `sessionId` + `operationId` 调 `figma_get_operation` 对账（切页后仍可用） |
+| `OPERATION_CONFLICT` | 同一 operationId 用了不同计划；换新 ID |
+| 导入路径被拒 | 路径必须在主目录或 `FIGMA_IMPORT_DIR` 内且为普通 PNG/JPEG/SVG 文件 |
+| `crypto.getRandomValues` 不可用 | 当前 Figma UI 环境无法安全生成随机数；换支持的环境 |
 
 ## 开发与验证
 
-修改加密实现时，使用 **Node.js >=20.19.0** 安装完整开发依赖并重新生成内联产物。构建无需启用依赖安装脚本。以下命令在仓库根目录开始执行；普通使用者无需此构建步骤：
+修改加密或插件源码时，用 Node.js >= 20.19.0 安装完整开发依赖并重建产物（普通使用者无需此步）：
 
 ```sh
 cd bridge
 npm ci --ignore-scripts
-npm run build:crypto
-npm run check:crypto
-npm run check
-npm test
+npm run build:crypto    # 重建 ui.html 内联加密块
+npm run build:plugin    # 由 plugin/src 打包 plugin/code.js
+npm run check           # 语法 + 产物一致性
+npm test                # 全量测试（229 项）
 ```
 
-安装测试使用临时目录和模拟 npm，覆盖残缺依赖、失败退出码、缺失 lockfile、绝对路径及 Windows 路径转义；不会修改真实 Agent 配置。本次安装入口已在 macOS、Node.js 25.9.0 上执行真实 `npm ci` 并加载锁定的 `ws 8.21.3`。Windows/Linux 和 Node.js 20 尚未进行对应环境的实际安装验收。
-
-2026-09-08 本地修复版在 macOS 26.6.2 arm64、Figma Desktop 126.8.18 上，通过官方 MCP SDK 1.30.0 完成了真实画布验收：两次 stdio 启动（Node.js 26.8.1 / 25.9.0）、九项工具调用、六类节点创建、文字与属性修改、回读、删除、分页、重复操作去重、旧页面/旧会话拒绝、手动断开与重新授权。第二次启动使用普通安装器生成的 Node 路径，且已省略全部开发依赖。七个测试节点均已删除；测试页原有顶层节点摘要与验收前一致。56 项自动化测试全部通过。
-
-这些是官方 SDK 客户端与该 Figma 实机组合的证据，不代表 Claude、Cursor、Codex、DSH 等每个宿主已逐一验收。此次真实 Figma 复用了本机已有配对密钥；全新用户首次粘贴/持久化、真实密钥轮换、网络故障导致的未知写入恢复仍需对应实机验证。认证、撤销、轮换与故障路径已有隔离回归测试。Windows/Linux 的安装入口与 Node.js 20 尚未实机验收；Linux 安装入口不等于提供 Linux Figma Desktop 支持。
-
-修改工具契约时，请同步桥接 schema、插件校验、测试与本文档。修改认证协议时，需要同步桥接、插件 UI 和认证测试。API 行为依据 [Figma Plugin API 官方文档](https://developers.figma.com/docs/plugins/api/api-reference/)。
+产物（`plugin/code.js`、`ui.html` 内联块）与源码必须同步提交：`npm run check:plugin` 与 `npm run check:crypto` 在发布前必须通过。测试套件覆盖：真实 stdio/WS 协议与故障路径（篡改、重放、超时、取消、批量、限额）、插件 VM 严格 fixture（各领域动作成功/失败/回滚/对账）、资源分块双向传输与完整性反例、安装链路。
 
 ## 许可证
 

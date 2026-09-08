@@ -19,3 +19,6 @@ Thumbs.db
 .env.local
 
 generated-config/
+
+# Defense in depth: never commit bridge artifacts even if FIGMA_BRIDGE_HOME points here
+artifacts/

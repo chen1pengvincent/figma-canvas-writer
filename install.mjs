@@ -85,7 +85,7 @@ export function install({ repositoryRoot = REPOSITORY_ROOT, npmCliPath, log = co
   log(`依赖与本机配置示例已就绪：${outputDirectory}`);
   log('下一步：将一个配置示例合并到 Agent 的现有 MCP 配置，再启动该 MCP 服务。');
   log(`随后将本机终端目录切换到 ${root}，运行 node bridge/mcp-bridge.js --show-pairing-key，取得配对密钥。`);
-  log(`在 Figma Desktop 导入 ${path.join(root, 'plugin', 'manifest.json')}，打开有编辑权限的 Design 文件，运行 Figma Canvas Writer 2 并粘贴密钥。`);
+  log(`在 Figma Desktop 导入 ${path.join(root, 'plugin', 'manifest.json')}，打开有编辑权限的 Design 文件，运行 Figma Canvas Writer 3 并粘贴密钥。`);
   log('同一时刻只使用一个 Agent 实例；安装器不会修改 Agent 配置或启动桥接。');
   return { outputDirectory };
 }

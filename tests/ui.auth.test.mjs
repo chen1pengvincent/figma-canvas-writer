@@ -1,9 +1,11 @@
 // Actual offline crypto bundle in the observed opaque-iframe environment (no subtle).
+// Protocol 3: runId/pageRevision context, pageRevision-bearing cmd frames and the
+// UI-side chunk transfer paths (outbound upload window, inbound import assembly).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import { webcrypto, randomBytes } from 'node:crypto';
+import { webcrypto, randomBytes, createHash } from 'node:crypto';
 import { AUTH_PROTOCOL, sign, verify, authProof, frameProof } from '../bridge/auth.js';
 
 const html = fs.readFileSync(new URL('../plugin/ui.html', import.meta.url), 'utf8');
@@ -12,7 +14,7 @@ const script = scripts.find(source => source.includes("const BRIDGE_URL ="));
 const cryptoBlock = html.match(/<!-- FCW_CRYPTO_BEGIN -->([\s\S]*?)<!-- FCW_CRYPTO_END -->/);
 const cryptoScript = cryptoBlock && Array.from(cryptoBlock[1].matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g), match => match[1]).join('\n');
 const key = 'cd'.repeat(32);
-const baseContext = { sessionId: 'ui-session', pageId: '10:1', pageName: '页面一', fileName: '测试文件', editorType: 'figma' };
+const baseContext = { sessionId: 'ui-session', runId: 'ui-run', pageId: '10:1', pageName: '页面一', fileName: '测试文件', editorType: 'figma', pageRevision: 0 };
 function harness(options = {}) {
   const elements = new Map();
   const mainMessages = [];
@@ -31,7 +33,8 @@ function harness(options = {}) {
   }
   const sandbox = {
     parent, window: { top }, document: { getElementById: element }, WebSocket: FakeWS,
-    crypto: options.noRandom ? {} : { getRandomValues: bytes => webcrypto.getRandomValues(bytes) }, isSecureContext: false, TextEncoder, Uint8Array,
+    crypto: options.noRandom ? {} : { getRandomValues: bytes => webcrypto.getRandomValues(bytes) }, isSecureContext: false,
+    TextEncoder, TextDecoder, Uint8Array,
     setTimeout(fn) { const t = { fn }; timers.add(t); return t; },
     clearTimeout(t) { timers.delete(t); },
   };
@@ -55,7 +58,10 @@ function harness(options = {}) {
     await h.receive(ws, { type: 'challenge', protocol: AUTH_PROTOCOL, serverNonce });
     const auth = ws.sent.at(-1);
     assert.equal(auth.type, 'auth');
+    assert.equal(auth.protocol, AUTH_PROTOCOL);
     assert(verify(key, authProof('client-auth', serverNonce, auth.clientNonce, auth.context), auth.proof));
+    assert.equal(auth.context.pageRevision, baseContext.pageRevision);
+    assert.equal(auth.context.runId, baseContext.runId);
     const connectionId = randomBytes(32).toString('hex');
     await h.receive(ws, { type: 'auth_ack', protocol: AUTH_PROTOCOL, ok: true, connectionId,
       proof: sign(key, authProof('server-auth', serverNonce, auth.clientNonce, auth.context, connectionId)) });
@@ -67,7 +73,12 @@ function harness(options = {}) {
   });
   return h;
 }
-const readCmd = id => ({ type: 'cmd', id, sessionId: baseContext.sessionId, pageId: baseContext.pageId, command: 'getContext', params: { limit: 5 } });
+const readCmd = id => ({ type: 'cmd', id, sessionId: baseContext.sessionId, pageId: baseContext.pageId, pageRevision: baseContext.pageRevision, command: 'getContext', params: { limit: 5 } });
+const chunkPayloads = ws => ws.sent.filter(x => x.type === 'frame' && x.payload.type === 'chunk').map(x => x.payload);
+const ackPayloads = ws => ws.sent.filter(x => x.type === 'frame' && x.payload.type === 'chunk_ack').map(x => x.payload);
+const sha256hex = bytes => createHash('sha256').update(bytes).digest('hex');
+const pngBytes = size => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(size - 8, 7)]);
+const delay = ms => new Promise(r => setTimeout(r, ms));
 
 test('UI actual offline bundle without subtle authenticates Node HMAC proof; authentic frame and signed result work', async () => {
   const h = harness(); const ws = await h.connect(); const info = await h.authenticate(ws);
@@ -79,6 +90,7 @@ test('UI actual offline bundle without subtle authenticates Node HMAC proof; aut
   await h.receive(ws, h.frame(info, 1, cmd));
   const exec = h.mainMessages.find(x => x.type === 'exec');
   assert.equal(exec.id, cmd.id); assert.equal(exec.sessionId, cmd.sessionId); assert.equal(exec.pageId, cmd.pageId);
+  assert.equal(exec.pageRevision, cmd.pageRevision, 'exec must forward the pageRevision target');
   const c = h.eval('connection');
   h.main({ type: 'exec_result', id: cmd.id, ok: false, error: { code: 'TEST', message: '真实错误', state: 'partial', affectedNodeIds: ['10:3'], details: { why: 'test' } } });
   await c.sendQueue;
@@ -113,6 +125,14 @@ test('UI replay or altered authenticated frame is rejected before a second execu
   const tampered = q.frame(info2, 1, readCmd('tamper')); tampered.payload.params.limit = 99;
   await q.receive(w, tampered);
   assert.equal(q.mainMessages.filter(x => x.type === 'exec').length, 0);
+});
+
+test('UI rejects an authenticated cmd whose pageRevision lags the bound context', async () => {
+  const h = harness(); const ws = await h.connect(); const info = await h.authenticate(ws);
+  const stale = { ...readCmd('stale-revision'), pageRevision: baseContext.pageRevision + 5 };
+  await h.receive(ws, h.frame(info, 1, stale));
+  assert.equal(h.mainMessages.filter(x => x.type === 'exec').length, 0);
+  assert.equal(ws.readyState, 3, 'a stale pageRevision target must disconnect the UI');
 });
 
 test('UI binds result to original connection generation; late result is dropped after network reconnect', async () => {
@@ -190,4 +210,115 @@ test('UI offline bundle never substitutes an insecure random source when getRand
   h.main({ type: 'init', context: baseContext });
   await assert.rejects(h.eval('setKey(' + JSON.stringify(key) + ', false)'), /安全随机数/);
   assert.equal(h.sockets.length, 0);
+});
+
+test('UI transfer_upload splits 64KiB chunks with a first-block header and honors the 4-unacked window', async () => {
+  const h = harness(); const ws = await h.connect(); const info = await h.authenticate(ws);
+  const raw = pngBytes(300 * 1024);
+  const sha = sha256hex(raw);
+  const transferId = 'ab'.repeat(16);
+  h.main({ type: 'transfer_upload', id: 'up-1', transferId, operationId: 'exp-1', totalBytes: raw.length, data: raw.toString('base64') });
+  await h.eval('connection.sendQueue');
+  let chunks = chunkPayloads(ws);
+  assert.equal(chunks.length, 4, 'only 4 unacked chunks may be in flight initially');
+  const first = chunks[0];
+  assert.equal(first.transferId, transferId);
+  assert.equal(first.index, 0);
+  assert.equal(first.done, false);
+  assert.equal(first.operationId, 'exp-1', 'first chunk must carry the header');
+  assert.equal(first.totalBytes, raw.length);
+  assert.equal(first.totalSha256, sha);
+  assert.equal(Buffer.from(first.data, 'base64').length, 64 * 1024);
+  for (const [i, chunk] of chunks.entries()) assert.equal(chunk.index, i);
+  const ack = h.frame(info, 1, { type: 'chunk_ack', transferId, index: 0 });
+  await h.receive(ws, ack);
+  await h.eval('connection.sendQueue');
+  chunks = chunkPayloads(ws);
+  assert.equal(chunks.length, 5, 'acknowledging one chunk must open the window for the next');
+  assert.equal(chunks[4].index, 4);
+  assert.equal(chunks[4].done, true, 'last chunk must carry done');
+  assert.equal(Buffer.from(chunks[4].data, 'base64').length, raw.length - 4 * 64 * 1024);
+  for (const index of [1, 2, 3, 4]) await h.receive(ws, h.frame(info, index + 1, { type: 'chunk_ack', transferId, index }));
+  await h.eval('connection.sendQueue');
+  const assembled = Buffer.concat(chunkPayloads(ws).map(c => Buffer.from(c.data, 'base64')));
+  assert(assembled.equals(raw), 'reassembled chunks must equal the uploaded bytes');
+  const done = h.mainMessages.find(x => x.type === 'transfer_upload_done');
+  assert(done, 'a fully acknowledged transfer must report completion to the main thread');
+  assert.equal(done.id, 'up-1');
+  assert.equal(done.ok, true);
+});
+
+test('UI stops sending outbound chunks when the connection drops mid-transfer', async () => {
+  const h = harness(); const ws = await h.connect(); const info = await h.authenticate(ws);
+  const raw = pngBytes(300 * 1024);
+  const transferId = 'cd'.repeat(16);
+  h.main({ type: 'transfer_upload', id: 'up-mid', transferId, operationId: 'exp-2', totalBytes: raw.length, data: raw.toString('base64') });
+  const c = h.eval('connection');
+  await c.sendQueue;
+  assert.equal(chunkPayloads(ws).length, 4);
+  ws.close();
+  const before = ws.sent.length;
+  ws.onmessage({ data: JSON.stringify(h.frame(info, 1, { type: 'chunk_ack', transferId, index: 0 })) });
+  await c.receiveQueue;
+  await delay(20);
+  assert.equal(ws.sent.length, before, 'no further chunks may be sent after disconnect');
+  assert(!h.mainMessages.some(x => x.type === 'transfer_upload_done' && x.ok === true), 'an abandoned transfer must not report success');
+});
+
+test('UI assembles importAsset chunks, acks every block and forwards import_asset_request after sha256 verification', async () => {
+  const h = harness(); const ws = await h.connect(); const info = await h.authenticate(ws);
+  const raw = pngBytes(100 * 1024);
+  const sha = sha256hex(raw);
+  const transferId = 'ef'.repeat(16);
+  const cmd = { type: 'cmd', id: 'imp-1', sessionId: baseContext.sessionId, pageId: baseContext.pageId, pageRevision: baseContext.pageRevision,
+    operationId: 'imp-1', command: 'importAsset', params: { transferId, totalBytes: raw.length, totalSha256: sha, format: 'PNG', fileName: 'a.png' } };
+  await h.receive(ws, h.frame(info, 1, cmd));
+  assert(!h.mainMessages.some(x => x.type === 'import_asset_request'), 'no request before the transfer completes');
+  const parts = [raw.subarray(0, 64 * 1024), raw.subarray(64 * 1024)];
+  await h.receive(ws, h.frame(info, 2, { type: 'chunk', transferId, index: 0, data: parts[0].toString('base64'), done: false }));
+  await h.eval('connection.sendQueue');
+  assert.deepEqual(ackPayloads(ws), [{ type: 'chunk_ack', transferId, index: 0 }]);
+  await h.receive(ws, h.frame(info, 3, { type: 'chunk', transferId, index: 1, data: parts[1].toString('base64'), done: true }));
+  await h.eval('connection.sendQueue');
+  assert.deepEqual(ackPayloads(ws), [
+    { type: 'chunk_ack', transferId, index: 0 },
+    { type: 'chunk_ack', transferId, index: 1 },
+  ]);
+  const req = h.mainMessages.find(x => x.type === 'import_asset_request');
+  assert(req, 'verified transfer must be forwarded to the main thread');
+  assert.equal(req.id, 'imp-1');
+  assert.equal(req.sessionId, baseContext.sessionId);
+  assert.equal(req.pageId, baseContext.pageId);
+  assert.equal(req.pageRevision, baseContext.pageRevision);
+  assert.equal(req.operationId, 'imp-1');
+  assert.equal(req.params.transferId, transferId);
+  assert.equal(req.params.totalBytes, raw.length);
+  assert.equal(req.params.totalSha256, sha);
+  assert.equal(req.params.format, 'PNG');
+  assert.equal(req.params.fileName, 'a.png');
+  assert.equal(Buffer.from(req.params.assetBase64, 'base64').equals(raw), true, 'assetBase64 must be the reassembled asset');
+});
+
+test('UI disconnects when the importAsset chunk stream fails the sha256 check', async () => {
+  const h = harness(); const ws = await h.connect(); const info = await h.authenticate(ws);
+  const raw = pngBytes(4096);
+  const transferId = '12'.repeat(16);
+  const cmd = { type: 'cmd', id: 'imp-bad', sessionId: baseContext.sessionId, pageId: baseContext.pageId, pageRevision: baseContext.pageRevision,
+    operationId: 'imp-bad', command: 'importAsset', params: { transferId, totalBytes: raw.length, totalSha256: 'f'.repeat(64), format: 'PNG', fileName: 'bad.png' } };
+  const c = h.eval('connection');
+  await h.receive(ws, h.frame(info, 1, cmd));
+  ws.onmessage({ data: JSON.stringify(h.frame(info, 2, { type: 'chunk', transferId, index: 0, data: raw.toString('base64'), done: true })) });
+  await c.receiveQueue;
+  await delay(20);
+  assert.equal(ws.readyState, 3, 'hash mismatch must fail closed');
+  assert(!h.mainMessages.some(x => x.type === 'import_asset_request'));
+});
+
+test('UI ignores chunk_ack for unknown transfers without breaking the connection', async () => {
+  const h = harness(); const ws = await h.connect(); const info = await h.authenticate(ws);
+  await h.receive(ws, h.frame(info, 1, { type: 'chunk_ack', transferId: 'ff'.repeat(16), index: 3 }));
+  assert.equal(ws.readyState, 1, 'unknown transfer acknowledgements must be ignored');
+  assert.equal(h.element('statusText').textContent, '已授权');
+  await h.receive(ws, h.frame(info, 2, readCmd('still-alive')));
+  assert(h.mainMessages.find(x => x.type === 'exec' && x.id === 'still-alive'), 'the connection must stay usable');
 });

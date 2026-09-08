@@ -1,15 +1,17 @@
 {
   "name": "figma-canvas-writer-bridge",
-  "version": "2.0.0",
-  "description": "单客户端 MCP stdio 桥接服务，将经本地授权的工具调用转发给 Figma Design 插件。",
+  "version": "3.0.0",
+  "description": "单客户端 MCP stdio 桥接服务（协议 3），将经本地授权的工具调用转发给 Figma Design/FigJam/Slides 插件。",
   "type": "module",
   "private": true,
   "main": "mcp-bridge.js",
   "scripts": {
     "build:crypto": "node ../scripts/build-crypto.mjs",
+    "build:plugin": "node ../scripts/build-plugin.mjs",
     "check:crypto": "node ../scripts/build-crypto.mjs --check",
+    "check:plugin": "node ../scripts/build-plugin.mjs --check",
     "check": "node --check mcp-bridge.js && node --check ../plugin/code.js && node --check ../install.mjs",
-    "test": "node --test ../tests/bridge.protocol.test.mjs ../tests/ui.auth.test.mjs ../tests/ui.crypto.test.mjs ../tests/plugin.test.mjs ../tests/install.test.mjs"
+    "test": "node --test ../tests/bridge.protocol.test.mjs ../tests/bridge-transfer.test.mjs ../tests/ui.auth.test.mjs ../tests/ui.crypto.test.mjs ../tests/plugin.test.mjs ../tests/install.test.mjs ../tests/read-layer.test.mjs ../tests/edit-domain.test.mjs ../tests/text-range.test.mjs ../tests/design-system.test.mjs ../tests/proto-motion.test.mjs ../tests/editors.test.mjs"
   },
   "engines": {
     "node": ">=20.0.0"

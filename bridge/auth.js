@@ -1,7 +1,8 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { normalizeContext as sharedNormalizeContext } from '../shared/context.js';
 
-export const AUTH_PROTOCOL = 2;
-export const AUTH_DOMAIN = 'figma-canvas-writer/v2';
+export const AUTH_PROTOCOL = 3;
+export const AUTH_DOMAIN = 'figma-canvas-writer/v3';
 export const KEY_RE = /^[0-9a-f]{64}$/i;
 
 // Sorted JSON is shared with the WebCrypto implementation in plugin/ui.html.
@@ -31,18 +32,6 @@ export function frameProof(direction, connectionId, seq, payload) {
   return { domain: AUTH_DOMAIN, kind: direction + '-frame', connectionId, seq, payload };
 }
 
-export function normalizeContext(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('缺少插件上下文');
-  const keys = ['sessionId', 'pageId', 'pageName', 'fileName'];
-  for (const k of keys) {
-    if (typeof value[k] !== 'string' || value[k].length > 1024 || ((k === 'sessionId' || k === 'pageId') && !value[k])) {
-      throw new Error('无效插件上下文: ' + k);
-    }
-  }
-  const context = Object.fromEntries(keys.map(k => [k, value[k]]));
-  if (value.editorType !== undefined) {
-    if (value.editorType !== 'figma') throw new Error('仅支持 Figma Design 文件');
-    context.editorType = value.editorType;
-  }
-  return context;
+export function normalizeContext(value, options = {}) {
+  return sharedNormalizeContext(value, options);
 }
