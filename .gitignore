@@ -17,3 +17,5 @@ Thumbs.db
 # 环境变量/本地覆盖
 .env
 .env.local
+
+generated-config/

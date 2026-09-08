@@ -1,4 +1,4 @@
-# 追加到 ~/.codex/config.toml
+# 合并到现有配置；请勿覆盖整个配置文件。
 [mcp_servers.figma-canvas-writer]
 command = "<Node 绝对路径>"
 args = ["<本仓库路径>/bridge/mcp-bridge.js"]

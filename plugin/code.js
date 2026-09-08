@@ -1,170 +1,137 @@
-// figma-canvas-writer/plugin/code.js
-// Figma Canvas Writer —— Figma 插件主线程（普通插件，在 Figma 设计文件内运行，有画布写权限）。
-// 作为命令执行器：经 ui.html(iframe, 有 WebSocket) 转发桥接命令，执行画布操作后回传结果。
-// 接收 {type:"cmd", id, command, params} 命令并执行画布操作，返回 {type:"resp", ...}。
-
-const BRIDGE_URL = 'ws://localhost:9753/plugin'; // 仅本机回环桥接地址
-const PROTOCOL = 1;                              // 与桥接侧约定的握手协议版本
-const AUTH_TOKEN_KEY = 'bridgeToken';            // token 存 Figma clientStorage
-const RECONNECT_MIN_MS = 1000;                   // 断线重连指数退避下限 1s
-const RECONNECT_MAX_MS = 15000;                  // 指数退避上限 15s
-
-// ---- 白名单（安全边界）----
-// 原因：所有命令与属性一律在白名单内分发/修改，未收录的键直接拒绝，
-// 防止通过命令名或属性名注入、访问画布之外的 API。
+// Figma Canvas Writer: current-page executor. Network authentication lives in ui.html.
+// sessionId routes a plugin run; it is never used as an authentication secret.
+const BRIDGE_URL = 'ws://localhost:9753/plugin';
+const AUTH_TOKEN_KEY = 'bridgeToken';
 const CREATE_TYPES = ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE', 'STAR'];
-const MODIFY_PROPS = new Set([
-  'name', 'x', 'y', 'width', 'height', 'rotation',
-  'opacity', 'visible', 'fills', 'strokes', 'strokeWeight', 'cornerRadius',
-]);
-const PAINT_TYPES = new Set([
-  'SOLID', 'GRADIENT_LINEAR', 'GRADIENT_RADIAL', 'GRADIENT_ANGULAR',
-  'GRADIENT_DIAMOND', 'IMAGE', 'VIDEO', 'EMOJI',
-]);
+const MODIFY_PROPS = new Set(['name', 'x', 'y', 'width', 'height', 'rotation',
+  'opacity', 'visible', 'fills', 'strokes', 'strokeWeight', 'cornerRadius']);
+const PAINT_TYPES = new Set(['SOLID', 'GRADIENT_LINEAR', 'GRADIENT_RADIAL',
+  'GRADIENT_ANGULAR', 'GRADIENT_DIAMOND', 'IMAGE', 'VIDEO', 'EMOJI']);
+const WRITES = new Set(['createNode', 'modifyNode', 'deleteNode', 'setText']);
+let sessionId = newSessionId();
+let pageRevision = 0;
+let queue = Promise.resolve();
+const operations = new Map();
+let operationBytes = 0;
 
-let reconnectDelay = RECONNECT_MIN_MS;
-let reconnectTimer = null;
-let connectionState = 'idle'; // idle|connecting|connected|authorized|auth_failed|disconnected
-let authDetail = '';
-
-// ---------------- 通用工具 ----------------
-
-function log(...args) { console.error('[figma-canvas-writer]', ...args); }
-
-// 防原型链污染：只接受“真·普通对象”（Object.prototype 直系），
-// 数组/Date/Map 及带自定义原型的对象一律拒绝，之后只按白名单键名取值。
+function newSessionId() {
+  return Date.now().toString(36) + '-' + Array.from({length: 4}, () => Math.random().toString(36).slice(2)).join('');
+}
 function isPlainObject(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v) &&
-    Object.getPrototypeOf(v) === Object.prototype;
+  return v !== null && typeof v === 'object' && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
 }
-function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
-
-class AppError extends Error {
-  constructor(code, message) { super(message); this.code = code; }
-}
-function appErr(code, message) { return new AppError(code, message); }
-
-function round3(v) { return Number.isFinite(v) ? Math.round(v * 1000) / 1000 : v; }
-function isFiniteNum(v, min, max) {
-  return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
-}
-function nextFrame() { return new Promise((res) => setTimeout(res, 0)); }
-
+function hasOwn(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+function appErr(code, message) { const e = new Error(message); e.code = code; return e; }
+function isFiniteNum(v, min, max) { return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max; }
 function requireStr(v, name, opts = {}) {
-  if (typeof v !== 'string' || (!opts.allowEmpty && v.length === 0)) {
-    throw appErr('INVALID_PARAM', `${name} 必须是非空字符串`);
-  }
+  if (typeof v !== 'string' || (!opts.allowEmpty && !v.length)) throw appErr('INVALID_PARAM', `${name} 必须是字符串`);
   return v;
-}
-function optStr(v, name) {
-  if (v === undefined || v === null) return undefined;
-  return requireStr(v, name, { allowEmpty: true });
 }
 function requireNum(v, name, min, max) {
-  if (!isFiniteNum(v, min, max)) {
-    throw appErr('INVALID_PARAM', `${name} 必须是 [${min}, ${max}] 内的有限数字`);
-  }
+  if (!isFiniteNum(v, min, max)) throw appErr('INVALID_PARAM', `${name} 必须在 [${min}, ${max}] 内`);
   return v;
-}
-function optNum(v, name, min, max) {
-  if (v === undefined || v === null) return undefined;
-  return requireNum(v, name, min, max);
 }
 function requireBool(v, name) {
   if (typeof v !== 'boolean') throw appErr('INVALID_PARAM', `${name} 必须是布尔值`);
   return v;
 }
-function optBool(v, name) {
-  if (v === undefined || v === null) return undefined;
-  return requireBool(v, name);
+function onlyKeys(p, keys) {
+  if (!isPlainObject(p)) throw appErr('INVALID_PARAM', 'params 必须是普通对象');
+  for (const k of Object.keys(p)) if (!keys.includes(k)) throw appErr('INVALID_PARAM', `未知参数: ${k}`);
 }
-
-// ---------------- 页面上下文 / 节点定位 ----------------
-
+function getContext() {
+  const pageName = String(figma.currentPage.name);
+  const fileName = String(figma.root.name);
+  return { sessionId, pageId: figma.currentPage.id, pageName: pageName.slice(0, 256),
+    fileName: fileName.slice(0, 256), editorType: figma.editorType,
+    ...(pageName.length > 256 ? { pageNameTruncated: true } : {}),
+    ...(fileName.length > 256 ? { fileNameTruncated: true } : {}) };
+}
+function assertTarget(t) {
+  if (t.sessionId !== sessionId) throw appErr('SESSION_CHANGED', '插件授权会话已变化，请重新读取状态');
+  if (t.pageId !== figma.currentPage.id || t.revision !== pageRevision) throw appErr('PAGE_CHANGED', '目标页面已变化，请重新读取状态');
+}
 function pageOfNode(node) {
-  let cur = node;
-  while (cur && cur.type !== 'PAGE' && cur.type !== 'DOCUMENT') cur = cur.parent;
-  return cur && cur.type === 'PAGE' ? cur : null;
+  let n = node;
+  while (n && n.type !== 'PAGE' && n.type !== 'DOCUMENT') n = n.parent;
+  return n && n.type === 'PAGE' ? n : null;
 }
-
-// 在指定页面上下文中执行 fn；跨页时切换 figma.currentPage（documentAccess: dynamic-page 允许运行时切页），
-// 原因：Figma 只允许在“当前页”直接修改节点，跨页必须先切页。
-async function withPageContext(page, fn) {
-  const was = figma.currentPage;
-  let switched = false;
-  if (page && page !== was) {
-    figma.currentPage = page;
-    switched = true;
-    await nextFrame(); // 切页后等一帧让 Figma 同步页面上下文
-  }
-  try {
-    return await fn();
-  } finally {
-    // 原因：改回原页，避免打扰用户当前正在查看的页面
-    if (switched && figma.currentPage !== was) figma.currentPage = was;
-  }
+async function getNode(id, t) {
+  requireStr(id, 'id');
+  const node = await figma.getNodeByIdAsync(id);
+  assertTarget(t);
+  if (!node || node.removed) throw appErr('NODE_NOT_FOUND', `找不到节点: ${id}`);
+  if (node.type === 'DOCUMENT' || node.type === 'PAGE') throw appErr('INVALID_TARGET', '请使用页面上下文接口读取页面');
+  if (!pageOfNode(node) || pageOfNode(node).id !== t.pageId) throw appErr('PAGE_CHANGED', '节点不在当前授权页面');
+  return node;
 }
-
-// 对目标节点执行 fn(node)；自动切到其所在页面并重新按 id 取引用
-// （原因：切页后旧的节点对象引用可能失效，必须重新 getNodeById）。
-async function withNode(nodeId, fn) {
-  const first = await figma.getNodeByIdAsync(String(nodeId));
-  if (!first) throw appErr('NODE_NOT_FOUND', `找不到节点: ${nodeId}`);
-  if (first.type === 'DOCUMENT' || first.type === 'PAGE') {
-    throw appErr('INVALID_TARGET', '不能对文档/页面节点执行该操作');
-  }
-  const page = pageOfNode(first);
-  return withPageContext(page, async () => {
-    const node = await figma.getNodeByIdAsync(String(nodeId));
-    if (!node) throw appErr('NODE_NOT_FOUND', `找不到节点: ${nodeId}`);
-    return fn(node);
-  });
+function markMutation(t, node) {
+  assertTarget(t);
+  if (node && (node.removed || !pageOfNode(node) || pageOfNode(node).id !== t.pageId)) throw appErr('PAGE_CHANGED', '节点已移出当前授权页面或被移除');
+  t.mutating = true;
+  if (node && !t.affected.includes(node.id)) t.affected.push(node.id);
 }
-
-// ---------------- 节点信息序列化 ----------------
-
-function buildNodeInfo(node, depth, maxDepth, maxTotal) {
-  if (!node || maxTotal <= 0) return null;
-  let geom;
-  try {
-    // 原因：TEXT 节点在字体未加载时读 width/height 可能抛错，逐个兜底
-    geom = {
-      x: round3(node.x), y: round3(node.y),
-      width: round3(node.width), height: round3(node.height),
-    };
-  } catch (e) {
-    geom = { x: null, y: null, width: null, height: null };
+function cloneValue(v) {
+  if (v === figma.mixed) return { mixed: true };
+  if (typeof v === 'number' && !Number.isFinite(v)) return null;
+  if (v === undefined) return undefined;
+  return JSON.parse(JSON.stringify(v));
+}
+function buildNodeInfo(node, depth = 0, budget = { remaining: 100, remainingChars: 56000 }) {
+  budget.remaining--;
+  const name = String(node.name);
+  const info = { id: node.id, name: name.slice(0, 1024), type: node.type, parentId: node.parent ? node.parent.id : null };
+  if (name.length > 1024) { info.nameTruncated = true; info.nameLength = name.length; }
+  const errors = [];
+  const truncatedFields = [];
+  budget.remainingChars -= JSON.stringify(info).length + 256;
+  for (const k of ['x','y','width','height','rotation','opacity','visible','locked',
+    'fills','strokes','strokeWeight','cornerRadius','fontName','fontSize','characters']) {
+    try {
+      if (!(k in node)) continue;
+      let v = cloneValue(node[k]);
+      if (k === 'characters' && typeof v === 'string' && v.length > 16000) {
+        info.charactersLength = v.length; info.charactersTruncated = true; v = v.slice(0, 16000);
+      }
+      if (v !== undefined) {
+        const size = JSON.stringify(v).length;
+        if (size > 24000 || size > budget.remainingChars) { truncatedFields.push(k); continue; }
+        budget.remainingChars -= size + k.length + 4;
+        info[k] = v;
+      }
+    } catch (e) { errors.push(k); }
   }
-  const info = {
-    id: node.id, name: node.name, type: node.type,
-    x: geom.x, y: geom.y, width: geom.width, height: geom.height,
-    rotation: round3(node.rotation), // Figma Plugin API 返回的 rotation 即度数(-180~180)
-    opacity: round3(node.opacity),
-    visible: !!node.visible,
-  };
-  if (node.type === 'TEXT') {
-    try { info.characters = String(node.characters || ''); } catch (e) { info.characters = null; }
-  }
-  let budget = maxTotal - 1;
-  const kids = node.children;
-  if (kids && kids.length && depth < maxDepth) {
+  const children = node.children || [];
+  info.childrenCount = children.length;
+  if (depth > 0 && children.length) {
     info.children = [];
-    for (const k of kids) {
-      if (budget <= 0) break; // 原因：限制递归规模，防止超大节点树打爆消息
-      const sub = buildNodeInfo(k, depth + 1, maxDepth, budget);
-      if (sub) { info.children.push(sub); budget -= countNodes(sub); }
+    for (const child of children) {
+      if (budget.remaining <= 0 || budget.remainingChars < 2000) break;
+      info.children.push(buildNodeInfo(child, depth - 1, budget));
     }
   }
+  info.truncated = children.length > ((info.children || []).length) || !!(info.children || []).find(n => n.truncated);
+  if (errors.length) info.readErrors = errors;
+  if (truncatedFields.length) { info.truncatedFields = truncatedFields; info.truncated = true; }
   return info;
 }
-function countNodes(info) {
-  let c = 1;
-  if (info.children) for (const ch of info.children) c += countNodes(ch);
-  return c;
+function paginate(nodes, p) {
+  onlyKeys(p, ['cursor','limit']);
+  const limit = p.limit === undefined ? 50 : requireNum(p.limit, 'limit', 1, 100);
+  if (!Number.isInteger(limit)) throw appErr('INVALID_PARAM', 'limit 必须是整数');
+  if (p.cursor !== undefined && (typeof p.cursor !== 'string' || !/^(0|[1-9][0-9]*)$/.test(p.cursor))) throw appErr('INVALID_PARAM', 'cursor 必须是非负整数的字符串');
+  const offset = p.cursor === undefined ? 0 : Number(p.cursor);
+  if (!Number.isSafeInteger(offset) || offset > nodes.length) throw appErr('INVALID_PARAM', 'cursor 超出范围，请重新从首页读取');
+  const budget = { remaining: 100, remainingChars: 56000 };
+  const selected = [];
+  for (const n of nodes.slice(offset, offset + limit)) {
+    if (budget.remainingChars < 18000 && selected.length) break;
+    selected.push(buildNodeInfo(n, 0, budget));
+  }
+  const next = offset + selected.length;
+  return { ...getContext(), nodes: selected, total: nodes.length,
+    nextCursor: next < nodes.length ? String(next) : null, truncated: next < nodes.length };
 }
-
-// ---------------- 输入校验（属性白名单 + 类型/范围 + 防原型链污染） ----------------
-
 function validatePaints(v, name) {
   if (!Array.isArray(v)) throw appErr('INVALID_PARAM', `${name} 必须是数组`);
   if (v.length > 32) throw appErr('INVALID_PARAM', `${name} 数量超过 32`);
@@ -187,7 +154,19 @@ function validatePaints(v, name) {
       if (c.a !== undefined && !isFiniteNum(c.a, 0, 1)) {
         throw appErr('INVALID_PARAM', 'color.a 需在 [0,1]');
       }
-      out.push({ type: 'SOLID', color: { r: c.r, g: c.g, b: c.b, a: c.a === undefined ? 1 : c.a } });
+      if (c.a !== undefined && paint.opacity !== undefined && c.a !== paint.opacity) {
+        throw appErr('INVALID_PARAM', 'color.a 与 opacity 冲突');
+      }
+      const normalized = { type: 'SOLID', color: { r: c.r, g: c.g, b: c.b } };
+      const opacity = paint.opacity === undefined ? c.a : paint.opacity;
+      if (opacity !== undefined) normalized.opacity = requireNum(opacity, 'opacity', 0, 1);
+      if (paint.visible !== undefined) normalized.visible = requireBool(paint.visible, 'visible');
+      if (paint.blendMode !== undefined) normalized.blendMode = requireStr(paint.blendMode, 'blendMode');
+      if (paint.boundVariables !== undefined) normalized.boundVariables = JSON.parse(JSON.stringify(paint.boundVariables));
+      const allowed = new Set(['type', 'color', 'opacity', 'visible', 'blendMode', 'boundVariables']);
+      for (const key of Object.keys(paint)) if (!allowed.has(key)) throw appErr('INVALID_PARAM', `不支持 SOLID.${key}`);
+      for (const key of Object.keys(c)) if (!['r', 'g', 'b', 'a'].includes(key)) throw appErr('INVALID_PARAM', `不支持 color.${key}`);
+      out.push(normalized);
     } else {
       // 非 SOLID（渐变/图片等）深拷贝为纯数据；JSON 往返同时剔除函数并规避 __proto__ 特殊键
       out.push(JSON.parse(JSON.stringify(paint)));
@@ -222,7 +201,7 @@ function validateModifyProps(props) {
       case 'name': out.name = requireStr(v, 'name', { allowEmpty: true }); break;
       case 'x': out.x = requireNum(v, 'x', -1e6, 1e6); break;
       case 'y': out.y = requireNum(v, 'y', -1e6, 1e6); break;
-      case 'width': out.width = requireNum(v, 'width', 0, 1e5); break;
+      case 'width': out.width = requireNum(v, 'width', 0.01, 1e5); break;
       case 'height': out.height = requireNum(v, 'height', 0, 1e5); break;
       case 'rotation': out.rotation = requireNum(v, 'rotation', -360, 360); break; // 角度
       case 'opacity': out.opacity = requireNum(v, 'opacity', 0, 1); break;
@@ -236,291 +215,251 @@ function validateModifyProps(props) {
   return out;
 }
 
-// ---------------- 字体加载 ----------------
 
 async function loadFont(font) {
   try { await figma.loadFontAsync(font); }
   catch (e) { throw appErr('FONT_NOT_LOADABLE', `无法加载字体 ${font.family} ${font.style}`); }
 }
-function dedupeFonts(list) {
+async function loadNodeFonts(node, extra) {
+  let fonts = [];
+  if (extra) fonts = [extra];
+  else if (node.characters.length) fonts = node.getRangeAllFontNames(0, node.characters.length);
+  else if (node.fontName !== figma.mixed) fonts = [node.fontName];
   const seen = new Set();
-  const out = [];
-  for (const f of list) {
-    const k = `${f.family}::${f.style}`;
-    if (!seen.has(k)) { seen.add(k); out.push(f); }
+  for (const f of fonts) {
+    const key = JSON.stringify(f);
+    if (!seen.has(key)) { seen.add(key); await loadFont(f); }
   }
-  return out;
 }
-
-// ---------------- 命令处理器 ----------------
-
-async function handlePing() {
-  return { pong: true, ts: Date.now() };
-}
-
-async function handleGetSelection() {
-  const sel = figma.currentPage.selection || [];
-  return sel.map((n) => buildNodeInfo(n, 0, 2, 60));
-}
-
-async function handleGetNodeInfo(p) {
-  const id = requireStr(p.id, 'id');
-  const depth = p.depth === undefined ? 3 : requireNum(p.depth, 'depth', 0, 6);
-  const data = await withNode(id, (node) => buildNodeInfo(node, 0, depth, 100));
-  return data;
-}
-
-async function handleCreateNode(p) {
-  const type = requireStr(p.type, 'type');
-  if (!CREATE_TYPES.includes(type)) {
-    throw appErr('INVALID_PARAM', `不支持创建的类型: ${type}（允许: ${CREATE_TYPES.join('/')}）`);
+function preflightProps(node, props) {
+  for (const k of Object.keys(props)) {
+    if (!(k in node)) throw appErr('UNSUPPORTED_PROPERTY', `${node.type} 不支持 ${k}`);
   }
-  const name = optStr(p.name, 'name');
-  const x = optNum(p.x, 'x', -1e6, 1e6);
-  const y = optNum(p.y, 'y', -1e6, 1e6);
-  const w = optNum(p.width, 'width', 0, 1e5);
-  const h = optNum(p.height, 'height', 0, 1e5);
-  const text = p.text === undefined ? undefined : requireStr(p.text, 'text', { allowEmpty: true });
-  if (type === 'TEXT' && text === undefined) {
-    throw appErr('INVALID_PARAM', '创建 TEXT 节点必须提供 text 内容');
+  if (hasOwn(props, 'width') || hasOwn(props, 'height')) {
+    if (typeof node.resize !== 'function') throw appErr('UNSUPPORTED_PROPERTY', '节点不能调整尺寸');
+    const w = hasOwn(props, 'width') ? props.width : node.width;
+    const h = hasOwn(props, 'height') ? props.height : node.height;
+    requireNum(w, 'width', 0.01, 1e5);
+    if (node.type === 'LINE') {
+      if (h !== 0) throw appErr('INVALID_PARAM', 'LINE 的 height 必须为 0');
+    } else requireNum(h, 'height', 0.01, 1e5);
   }
-  let parentId;
-  let parentPre = null;
-  if (p.parentId !== undefined && p.parentId !== null) {
-    parentId = requireStr(p.parentId, 'parentId');
-    parentPre = await figma.getNodeByIdAsync(parentId);
-    if (!parentPre) throw appErr('NODE_NOT_FOUND', `找不到父节点: ${parentId}`);
-    if (parentPre.type !== 'FRAME') throw appErr('INVALID_PARAM', 'parentId 必须是 FRAME 节点');
-  }
-  const targetPage = parentPre ? pageOfNode(parentPre) : figma.currentPage;
-  if (!targetPage) throw appErr('INVALID_PARAM', '无法确定创建目标页面');
-
-  return withPageContext(targetPage, async () => {
-    // 原因：切页后需重新按 id 取父节点引用
-    const parent = parentId ? await figma.getNodeByIdAsync(parentId) : null;
-    let node = null;
-    if (type === 'RECTANGLE') node = figma.createRectangle();
-    else if (type === 'ELLIPSE') node = figma.createEllipse();
-    else if (type === 'TEXT') {
-      node = figma.createText();
-      await loadFontForText(node); // 写字符前必须先加载字体
-      node.characters = text;
-    } else if (type === 'FRAME') {
-      node = figma.createFrame();
-    } else if (type === 'LINE') {
-      node = figma.createLine();
-      node.strokeWeight = 1;
-      node.strokes = [{ type: 'SOLID', color: { r: 0, g: 0, b: 0, a: 1 } }];
-    } else if (type === 'STAR') {
-      node = figma.createStar(); // Figma Plugin API 原生星形
+}
+function applyProps(node, props, t) {
+  preflightProps(node, props);
+  const applied = [];
+  try {
+    for (const k of Object.keys(props)) {
+      if (k === 'width' || k === 'height') continue;
+      markMutation(t, node); node[k] = props[k]; applied.push(k);
     }
-    if (!node) throw appErr('CREATE_FAILED', '节点创建失败');
-    if (name !== undefined) node.name = name;
-
-    if (parent) parent.appendChild(node); // 挂到指定 FRAME
-    else figma.currentPage.appendChild(node); // 否则留在当前页
-
-    if (type !== 'LINE' && (w !== undefined || h !== undefined)) {
-      const cw = w !== undefined ? w : node.width;
-      const ch = h !== undefined ? h : node.height;
-      try { node.resize(cw, ch); } catch (e) { /* LINE 等不支持 resize 时忽略 */ }
+    if (hasOwn(props, 'width') || hasOwn(props, 'height')) {
+      markMutation(t, node);
+      node.resize(hasOwn(props, 'width') ? props.width : node.width,
+        node.type === 'LINE' ? 0 : hasOwn(props, 'height') ? props.height : node.height);
+      applied.push('size');
     }
-    if (x !== undefined) node.x = x;
-    if (y !== undefined) node.y = y;
-    // 修复: createNode 之前完全没应用 props(fills/strokes/rotation 等), 导致颜色等属性丢失。
-    // 在定位后统一应用 props(经 validateModifyProps 做 hex 颜色转换 + applyProps 应用)
-    if (p.props !== undefined && p.props !== null) {
-      const extraProps = validateModifyProps(p.props);
-      await applyProps(node, extraProps);
-    }
-    return { id: node.id, name: node.name, type: node.type };
-  });
-}
-
-async function loadFontForText(textNode) {
-  let font = null;
-  try { font = textNode.fontName; } catch (e) { font = null; }
-  const target = font || { family: 'Inter', style: 'Regular' };
-  try { await figma.loadFontAsync(target); }
-  catch (e) {
-    if (font) throw appErr('FONT_NOT_LOADABLE', `无法加载默认字体 ${font.family} ${font.style}`);
-    throw appErr('FONT_NOT_LOADABLE', '无法加载默认字体 Inter Regular');
+  } catch (e) {
+    const failure = appErr('PROP_APPLY_FAILED', e.message);
+    failure.state = t.mutating ? 'partial' : 'not_started';
+    failure.details = { appliedProperties: applied };
+    if (t.mutating && !node.removed && pageOfNode(node) && pageOfNode(node).id === t.pageId) failure.details.readBack = buildNodeInfo(node);
+    throw failure;
   }
 }
-
-async function handleModifyNode(p) {
-  const id = requireStr(p.id, 'id');
+async function handleCreateNode(p, t) {
+  onlyKeys(p, ['type','name','x','y','width','height','parentId','text','props']);
+  if (!CREATE_TYPES.includes(p.type)) throw appErr('INVALID_PARAM', '不支持创建该类型');
+  const props = p.props === undefined ? {} : validateModifyProps(p.props);
+  for (const k of ['name','x','y','width','height']) {
+    if (hasOwn(p, k)) {
+      if (hasOwn(props, k)) throw appErr('INVALID_PARAM', `重复指定属性 ${k}`);
+      Object.assign(props, validateModifyProps({ [k]: p[k] }));
+    }
+  }
+  if (p.type === 'TEXT') requireStr(p.text, 'text', {allowEmpty: true});
+  else if (p.text !== undefined) throw appErr('INVALID_PARAM', 'text 只用于 TEXT');
+  if (hasOwn(props, 'height')) {
+    if (p.type === 'LINE' && props.height !== 0) throw appErr('INVALID_PARAM', 'LINE 的 height 必须为 0');
+    if (p.type !== 'LINE') requireNum(props.height, 'height', 0.01, 1e5);
+  }
+  const parent = p.parentId === undefined ? null : await getNode(p.parentId, t);
+  if (parent && parent.type !== 'FRAME') throw appErr('INVALID_TARGET', 'parentId 必须是当前页 FRAME');
+  const font = { family: 'Inter', style: 'Regular' };
+  if (p.type === 'TEXT') await loadFont(font);
+  assertTarget(t); // no node may be created on a page changed during an await
+  if (parent && (parent.removed || !pageOfNode(parent) || pageOfNode(parent).id !== t.pageId)) throw appErr('PAGE_CHANGED', '父节点已移出当前授权页面或被移除');
+  let node;
+  try {
+    const creators = { RECTANGLE: 'createRectangle', ELLIPSE: 'createEllipse', TEXT: 'createText',
+      FRAME: 'createFrame', LINE: 'createLine', STAR: 'createStar' };
+    markMutation(t);
+    node = figma[creators[p.type]]();
+    t.affected.push(node.id);
+    if (parent) parent.appendChild(node);
+    if (p.type === 'TEXT') { node.fontName = font; node.characters = p.text; }
+    applyProps(node, props, t);
+    return buildNodeInfo(node);
+  } catch (e) {
+    if (node) {
+      try { node.remove(); e.state = 'rolled_back'; t.affected = []; }
+      catch (cleanup) { e.state = 'partial'; e.details = { cleanupError: cleanup.message }; }
+    } else e.state = 'unknown';
+    throw e;
+  }
+}
+async function handleModifyNode(p, t) {
+  onlyKeys(p, ['id','props']);
   const props = validateModifyProps(p.props);
-  const applied = await withNode(id, async (node) => {
-    await applyProps(node, props);
-    return { id: node.id };
-  });
-  return applied;
+  const node = await getNode(p.id, t);
+  preflightProps(node, props);
+  if (node.type === 'TEXT' && (hasOwn(props,'width') || hasOwn(props,'height'))) await loadNodeFonts(node);
+  assertTarget(t);
+  applyProps(node, props, t);
+  return buildNodeInfo(node);
 }
-
-async function applyProps(node, props) {
-  const has = (k) => hasOwn(props, k);
-  // 逐属性 try/catch：Figma 不同节点类型对属性支持不同，给出干净的错误
-  try { if (has('name')) node.name = props.name; } catch (e) { throw appErr('PROP_APPLY_FAILED', `name 应用失败: ${e.message}`); }
-  if (has('x') || has('y')) {
-    try {
-      node.x = has('x') ? props.x : node.x;
-      node.y = has('y') ? props.y : node.y;
-    } catch (e) { throw appErr('PROP_APPLY_FAILED', `位置属性应用失败: ${e.message}`); }
+async function handleSetText(p, t) {
+  onlyKeys(p, ['id','text','fontName','fontSize','x','y']);
+  if (p.text !== undefined) requireStr(p.text, 'text', { allowEmpty: true });
+  if (p.fontSize !== undefined) requireNum(p.fontSize, 'fontSize', 1, 1000);
+  for (const k of ['x','y']) if (p[k] !== undefined) requireNum(p[k], k, -1e6, 1e6);
+  if (p.fontName !== undefined) {
+    onlyKeys(p.fontName, ['family','style']);
+    requireStr(p.fontName.family, 'fontName.family'); requireStr(p.fontName.style, 'fontName.style');
   }
-  if (has('width') || has('height')) {
-    const nw = has('width') ? props.width : node.width;
-    const nh = has('height') ? props.height : node.height;
-    if (node.type !== 'LINE') {
-      try { node.resize(nw, nh); }
-      catch (e) { throw appErr('PROP_APPLY_FAILED', `resize 失败: ${e.message}`); }
-    }
-  }
+  const node = await getNode(p.id, t);
+  if (node.type !== 'TEXT') throw appErr('INVALID_TARGET', '目标不是文本节点');
+  // Moving text does not require loading or normalizing its fonts.
+  if (p.fontName !== undefined || p.fontSize !== undefined || p.text !== undefined) await loadNodeFonts(node, p.fontName);
+  assertTarget(t);
   try {
-    if (has('rotation')) node.rotation = props.rotation; // Figma Plugin API 的 rotation 即度数, 直接写入
-  } catch (e) { throw appErr('PROP_APPLY_FAILED', `rotation 应用失败: ${e.message}`); }
-  try { if (has('opacity')) node.opacity = props.opacity; } catch (e) { throw appErr('PROP_APPLY_FAILED', `opacity 应用失败: ${e.message}`); }
-  try { if (has('visible')) node.visible = props.visible; } catch (e) { throw appErr('PROP_APPLY_FAILED', `visible 应用失败: ${e.message}`); }
-  try { if (has('strokeWeight')) node.strokeWeight = props.strokeWeight; } catch (e) { throw appErr('PROP_APPLY_FAILED', '该节点不支持 strokeWeight'); }
-  try { if (has('cornerRadius')) node.cornerRadius = props.cornerRadius; } catch (e) { throw appErr('PROP_APPLY_FAILED', '该节点不支持 cornerRadius'); }
-  try { if (has('fills')) node.fills = props.fills; } catch (e) { throw appErr('PROP_APPLY_FAILED', `fills 应用失败: ${e.message}`); }
-  try { if (has('strokes')) node.strokes = props.strokes; } catch (e) { throw appErr('PROP_APPLY_FAILED', `strokes 应用失败: ${e.message}`); }
-}
-
-async function handleDeleteNode(p) {
-  const id = requireStr(p.id, 'id');
-  const removed = await withNode(id, (node) => { node.remove(); return { id }; });
-  return removed;
-}
-
-async function handleSetText(p) {
-  const id = requireStr(p.id, 'id');
-  const text = p.text === undefined ? '' : requireStr(p.text, 'text', { allowEmpty: true });
-  const fontSize = optNum(p.fontSize, 'fontSize', 1, 1000);
-  const x = optNum(p.x, 'x', -1e6, 1e6);
-  const y = optNum(p.y, 'y', -1e6, 1e6);
-  let fontNameObj = null;
-  if (p.fontName !== undefined && p.fontName !== null) {
-    if (!isPlainObject(p.fontName) ||
-        typeof p.fontName.family !== 'string' || typeof p.fontName.style !== 'string') {
-      throw appErr('INVALID_PARAM', 'fontName 必须是 {family, style} 字符串对象');
+    for (const k of ['fontName','fontSize','text','x','y']) {
+      if (!hasOwn(p, k)) continue;
+      markMutation(t, node); node[k === 'text' ? 'characters' : k] = p[k];
     }
-    fontNameObj = { family: p.fontName.family, style: p.fontName.style };
-  }
-
-  const res = await withNode(id, async (node) => {
-    if (node.type !== 'TEXT') throw appErr('INVALID_TARGET', '目标节点不是文本节点');
-    // 先确定要加载的字体：显式 fontName 优先；否则取当前字体；都没有则退回默认
-    let fontsToLoad = [];
-    if (fontNameObj) {
-      fontsToLoad.push(fontNameObj);
-    } else {
-      try {
-        const len = node.characters.length;
-        fontsToLoad.push(...node.getRangeAllFontNames(0, Math.max(len, 1)));
-      } catch (e) { /* 忽略空文本/未加载字体的读取失败 */ }
-      if (fontsToLoad.length === 0) fontsToLoad.push({ family: 'Inter', style: 'Regular' });
-    }
-    // 原因：修改字符内容前必须先 loadFontAsync 目标字体，否则 Figma 抛 “font not loaded”
-    const uniq = dedupeFonts(fontsToLoad);
-    for (const f of uniq) await loadFont(f);
-    if (fontNameObj) node.fontName = fontNameObj;
-    if (fontSize !== undefined) node.fontSize = fontSize;
-    node.characters = text;
-    if (x !== undefined) node.x = x;
-    if (y !== undefined) node.y = y;
-    return { id: node.id, characters: text };
-  });
-  return res;
+  } catch (e) { e.state = t.mutating ? 'partial' : 'not_started'; throw e; }
+  return buildNodeInfo(node);
 }
-
-// ---------------- 命令分发 ----------------
-
+async function handleDeleteNode(p, t) {
+  onlyKeys(p, ['id']);
+  const node = await getNode(p.id, t);
+  markMutation(t, node); node.remove();
+  return { id: p.id, deleted: true };
+}
 const HANDLERS = {
-  ping: handlePing,
-  getSelection: handleGetSelection,
-  getNodeInfo: handleGetNodeInfo,
-  createNode: handleCreateNode,
-  modifyNode: handleModifyNode,
-  deleteNode: handleDeleteNode,
-  setText: handleSetText,
+  ping: async () => ({ pong: true, ...getContext() }),
+  getContext: async (p) => paginate(figma.currentPage.children, p),
+  getSelection: async (p) => paginate(figma.currentPage.selection || [], p),
+  getNodeInfo: async (p,t) => {
+    onlyKeys(p, ['id','depth']);
+    const depth = p.depth === undefined ? 3 : requireNum(p.depth, 'depth', 0, 6);
+    if (!Number.isInteger(depth)) throw appErr('INVALID_PARAM', 'depth 必须是整数');
+    return buildNodeInfo(await getNode(p.id,t), depth);
+  },
+  createNode: handleCreateNode, modifyNode: handleModifyNode, setText: handleSetText, deleteNode: handleDeleteNode,
 };
-
-
-// ---------------- 通信层（postMessage ↔ ui.html；主线程无 WebSocket，网络全在 iframe） ----------------
-// 架构：主线程(本文件, QuickJS, 有 Plugin API, 无 WebSocket) ←→ ui.html(iframe, 有 WebSocket) ←→ 桥接
-// 桥接命令经 ui.html 转发给主线程执行，结果原路返回。
-
-function postToUi(obj) {
-  try { figma.ui.postMessage(obj); } catch (e) { /* UI 未就绪时忽略 */ }
+function canonical(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+  if (isPlainObject(value)) return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
+  return JSON.stringify(value);
 }
-
-// 执行命令并回传结果给 ui.html（由它经 WebSocket 回桥接）
-async function execAndReply(id, command, params) {
+function postToUi(value) { figma.ui.postMessage(value); }
+function failure(e, t) {
+  return { ok: false, error: { code: e.code || 'PLUGIN_ERROR', message: e.message || String(e),
+    state: e.state || (t.mutating ? 'unknown' : 'not_started'), affectedNodeIds: t.affected,
+    ...(e.details ? { details: e.details } : {}) } };
+}
+async function execute(msg, t) {
   try {
-    if (!(command in HANDLERS)) {
-      postToUi({ type: 'exec_result', id, ok: false, error: { code: 'UNKNOWN_COMMAND', message: `未知命令: ${String(command)}` } });
-      return;
+    assertTarget(t);
+    if (!hasOwn(HANDLERS, msg.command)) throw appErr('UNKNOWN_COMMAND', '未知命令');
+    if (!isPlainObject(msg.params)) throw appErr('INVALID_PARAM', 'params 必须是普通对象');
+    const data = await HANDLERS[msg.command](msg.params, t);
+    return { ok: true, data: WRITES.has(msg.command)
+      ? { ...data, state: 'succeeded', operationId: msg.operationId, affectedNodeIds: t.affected } : data };
+  } catch (e) { return failure(e,t); }
+}
+async function dispatch(msg) {
+  const t = { sessionId: msg.sessionId, pageId: msg.pageId, revision: pageRevision, mutating: false, affected: [] };
+  const reply = r => postToUi({ type:'exec_result', id:msg.id, ...r });
+  if (msg.command === 'ping') { reply({ok:true,data:await HANDLERS.ping()}); return; }
+  try { assertTarget(t); } catch (e) { reply(failure(e,t)); return; }
+  if (msg.command === 'getOperation') {
+    try {
+      onlyKeys(msg.params, ['operationId']);
+      const id = requireStr(msg.params.operationId, 'operationId');
+      const rec = operations.get(id);
+      if (rec && (rec.sessionId !== msg.sessionId || rec.pageId !== msg.pageId)) throw appErr('OPERATION_TARGET_MISMATCH', '操作属于另一目标');
+      reply({ok:true,data: rec ? {operationId:id,state:rec.state,result:rec.result || null} : {operationId:id,state:'not_found'}});
+    } catch (e) { reply(failure(e,t)); }
+    return;
+  }
+  if (!WRITES.has(msg.command)) {
+    // Reads wait for earlier mutations; result lookup above may inspect an in-flight write.
+    const task = queue.then(() => execute(msg,t));
+    queue = task.then(() => undefined, () => undefined);
+    reply(await task); return;
+  }
+  let rec;
+  try {
+    const id = requireStr(msg.operationId, 'operationId');
+    if (id.length > 128) throw appErr('INVALID_PARAM', 'operationId 过长');
+    if (!isPlainObject(msg.params)) throw appErr('INVALID_PARAM', 'params 必须是普通对象');
+    const signature = canonical({ sessionId:msg.sessionId,pageId:msg.pageId,command:msg.command,params:msg.params });
+    rec = operations.get(id);
+    if (rec) {
+      if (rec.signature !== signature) throw appErr('OPERATION_CONFLICT', '同一个 operationId 不能用于不同操作');
+      reply(await rec.promise); return;
     }
-    const data = await HANDLERS[command](params);
-    postToUi({ type: 'exec_result', id, ok: true, data });
-  } catch (err) {
-    const code = err && err.code ? err.code : 'PLUGIN_ERROR';
-    const message = err && err.message ? err.message : String(err);
-    postToUi({ type: 'exec_result', id, ok: false, error: { code, message } });
-  }
+    const reserve = signature.length * 2 + 1024;
+    if (operations.size >= 1000 || operationBytes + reserve > 8 * 1024 * 1024) throw appErr('OPERATION_CAPACITY', '本次插件运行操作记录已满；对账后重开插件，不会逐出旧记录再重复执行');
+    operationBytes += reserve;
+    rec = { signature,sessionId:msg.sessionId,pageId:msg.pageId,state:'queued',result:null };
+    rec.promise = queue.then(async () => {
+      rec.state = 'running';
+      const result = operationBytes + 196608 > 8 * 1024 * 1024
+        ? failure(appErr('OPERATION_CAPACITY', '操作记录已满，请对账后重开插件'), t)
+        : await execute(msg,t);
+      rec.result = result;
+      operationBytes += JSON.stringify(result).length * 2 - 1024;
+      rec.state = result.ok ? 'succeeded' : result.error.state === 'partial' ? 'partial' : result.error.state === 'unknown' ? 'unknown' : 'failed';
+      return result;
+    });
+    operations.set(id,rec);
+    queue = rec.promise.then(() => undefined, () => undefined);
+    reply(await rec.promise);
+  } catch (e) { reply(failure(e,t)); }
 }
 
-// ---------------- 启动 ----------------
-
-figma.showUI(__html__, { width: 280, height: 230 });
-
-// 通知 UI 当前是否有已保存 token（供 UI 决定显示配对框还是直接连）
-(async () => {
-  let hasToken = false;
-  try {
-    const t = await figma.clientStorage.getAsync(AUTH_TOKEN_KEY);
-    hasToken = typeof t === 'string' && t.length > 0;
-  } catch (e) { /* ignore */ }
-  postToUi({ type: 'init', hasToken, bridgeUrl: BRIDGE_URL });
-})();
-
-figma.ui.onmessage = async (msg) => {
-  if (!msg || typeof msg !== 'object') return;
-
-  // UI 转发的桥接命令：执行并回结果
-  if (msg.type === 'exec') {
-    const id = msg.id === undefined || msg.id === null ? null : msg.id;
-    if (id === null) return;
-    const params = (msg.params && typeof msg.params === 'object' && !Array.isArray(msg.params)) ? msg.params : {};
-    execAndReply(id, msg.command, params);
-    return;
+figma.showUI(__html__, { width: 360, height: 440 });
+postToUi({type:'init',context:getContext(),bridgeUrl:BRIDGE_URL});
+figma.on('currentpagechange', () => {
+  pageRevision++;
+  postToUi({type:'context',context:getContext()});
+});
+figma.ui.onmessage = async msg => {
+  if (!isPlainObject(msg)) return;
+  if (msg.type === 'exec' && (typeof msg.id === 'string' || typeof msg.id === 'number')) {
+    await dispatch(msg); return;
   }
-
-  // UI 要求保存配对拿到的 token
-  if (msg.type === 'saveToken') {
-    const token = typeof msg.token === 'string' ? msg.token : '';
-    try { await figma.clientStorage.setAsync(AUTH_TOKEN_KEY, token); }
-    catch (e) { postToUi({ type: 'saved', ok: false }); return; }
-    postToUi({ type: 'saved', ok: true });
-    return;
+  if (msg.type === 'revoke') {
+    sessionId = newSessionId(); pageRevision++;
+    postToUi({type:'context',context:getContext()}); return;
   }
-
-  // UI 要求读取已保存 token（用于 auto-connect 鉴权）
   if (msg.type === 'getToken') {
-    let token = '';
+    postToUi({type:'context',context:getContext()});
     try {
       const t = await figma.clientStorage.getAsync(AUTH_TOKEN_KEY);
-      if (typeof t === 'string') token = t;
-    } catch (e) { /* ignore */ }
-    postToUi({ type: 'token', token });
-    return;
-  }
-
-  // UI 要求清除配对（重新配对）
-  if (msg.type === 'clearToken') {
-    try { await figma.clientStorage.deleteAsync(AUTH_TOKEN_KEY); } catch (e) { /* ignore */ }
-    postToUi({ type: 'tokenCleared' });
-    return;
+      postToUi({type:'token',token:typeof t === 'string' && /^[a-f0-9]{64}$/.test(t) ? t : ''});
+    } catch (e) { postToUi({type:'token',token:'',error:'无法读取本地配对信息'}); }
+  } else if (msg.type === 'saveToken') {
+    try {
+      if (typeof msg.token !== 'string' || !/^[a-f0-9]{64}$/.test(msg.token)) throw new Error('配对密钥格式错误');
+      await figma.clientStorage.setAsync(AUTH_TOKEN_KEY,msg.token);
+      postToUi({type:'saved',ok:true});
+    } catch (e) { postToUi({type:'saved',ok:false,error:e.message}); }
+  } else if (msg.type === 'clearToken') {
+    try { await figma.clientStorage.deleteAsync(AUTH_TOKEN_KEY); postToUi({type:'tokenCleared',ok:true}); }
+    catch (e) { postToUi({type:'tokenCleared',ok:false,error:e.message}); }
   }
 };

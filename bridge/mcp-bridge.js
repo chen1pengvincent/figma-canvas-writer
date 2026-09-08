@@ -1,737 +1,579 @@
-// figma-canvas-writer/bridge/mcp-bridge.js
-// Figma Canvas Writer 桥接服务（Node 侧，供任意 MCP agent 调用）：
-//   1) 以 MCP stdio server 姿态供任意 MCP agent 调用（stdout 是 MCP 通道，所有日志一律写 stderr）；
-//   2) 同时起一个 WebSocket server（127.0.0.1:9753/plugin），Figma 插件作为客户端接入；
-//   3) 每个 MCP 工具调用 -> 白名单校验（防御纵深）-> 转成 WS 命令发给插件 -> 等插件响应（15s 超时）-> 回 MCP。
-// 运行：node mcp-bridge.js   （agent 通过 stdio 拉起）
-
+// MCP stdio owns this process and the single local Figma connection.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:http';
-import { createInterface } from 'node:readline';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-
+import { randomBytes } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
+import { AUTH_PROTOCOL, KEY_RE, sign, verify, authProof, frameProof, normalizeContext } from './auth.js';
 
-// ---------------- 常量 ----------------
-
-const HOST = '::';       // 绑双栈(IPv4+IPv6), 让 localhost 无论解析到 127.0.0.1 还是 ::1 都能连; 安全性由 connection 处的回环白名单校验保证
-const PORT = Number(process.env.FIGMA_BRIDGE_PORT || 9753);  // 可用环境变量覆盖(多 agent 隔离)
-const WS_PATH = '/plugin';      // 插件连接路径
-const PROTOCOL = 1;             // 与插件约定的鉴权协议版本
-const CMD_TIMEOUT_MS = Number(process.env.FIGMA_BRIDGE_TIMEOUT_MS || 15000);   // 等待插件响应的超时
-const RATE_BURST = 20;          // 令牌桶容量（20 cmd/s）
-const RATE_REFILL_PER_SEC = 20; // 令牌补充速率
-const MAX_MSG_BYTES = 256 * 1024; // 单条消息上限 256KB
-
-// 配置目录：优先环境变量 FIGMA_BRIDGE_HOME，否则用中性名 .figma-canvas-writer
-// 向后兼容：若旧目录 ~/.dsh-figma-bridge 存在则复用（避免已有用户 token 丢失）
+const HOST = '127.0.0.1';
+const IPV6_HOST = '::1';
+const TEST_PORT = process.env.FIGMA_BRIDGE_TEST_PORT;
+const PORT = TEST_PORT === undefined ? 9753 : Number(TEST_PORT);
+const WS_PATH = '/plugin';
+const MAX_MSG_BYTES = 256 * 1024;
+const MAX_STDIO_BYTES = 1024 * 1024;
+const MAX_PENDING = 100;
+const SUPPORTED_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
+const SERVER_INFO = { name: 'figma-canvas-writer', version: '2.0.0' };
 const LEGACY_DIR = path.join(os.homedir(), '.dsh-figma-bridge');
-const DEFAULT_DIR = path.join(os.homedir(), '.figma-canvas-writer');
-const CONFIG_DIR = process.env.FIGMA_BRIDGE_HOME
-  || (fs.existsSync(LEGACY_DIR) ? LEGACY_DIR : DEFAULT_DIR);
+const CONFIG_DIR = process.env.FIGMA_BRIDGE_HOME || (fs.existsSync(LEGACY_DIR) ? LEGACY_DIR : path.join(os.homedir(), '.figma-canvas-writer'));
 const TOKEN_FILE = path.join(CONFIG_DIR, 'bridge-token');
 const AUDIT_FILE = path.join(CONFIG_DIR, 'audit.log');
+const WRITE_COMMANDS = new Set(['createNode', 'modifyNode', 'deleteNode', 'setText']);
+const CMD_TIMEOUT_MS = process.env.FIGMA_BRIDGE_TIMEOUT_MS === undefined ? 15000 : Number(process.env.FIGMA_BRIDGE_TIMEOUT_MS);
+const log = (...args) => console.error('[figma-canvas-writer]', ...args);
+const own = (v, k) => Object.prototype.hasOwnProperty.call(v, k);
+const plain = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const error = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
 
-const COMMAND_WHITELIST = new Set([
-  'ping', 'getSelection', 'getNodeInfo', 'createNode', 'modifyNode', 'deleteNode', 'setText',
-]);
-const CREATE_TYPES = ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE', 'STAR'];
-const MODIFY_PROPS = new Set([
-  'name', 'x', 'y', 'width', 'height', 'rotation',
-  'opacity', 'visible', 'fills', 'strokes', 'strokeWeight', 'cornerRadius',
-]);
-const PAINT_TYPES = new Set([
-  'SOLID', 'GRADIENT_LINEAR', 'GRADIENT_RADIAL', 'GRADIENT_ANGULAR',
-  'GRADIENT_DIAMOND', 'IMAGE', 'VIDEO', 'EMOJI',
-]);
-
-// ---------------- 基础工具 ----------------
-
-function log(...args) { console.error('[figma-canvas-writer]', ...args); }
-
-function isPlainObject(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v) &&
-    Object.getPrototypeOf(v) === Object.prototype;
-}
-function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
-
-class BridgeError extends Error {
-  constructor(code, message) { super(message); this.code = code; }
-}
-function err(code, message) { return new BridgeError(code, message); }
-
-function isFiniteNum(v, min, max) {
-  return typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max;
-}
-function requireStr(v, name, opts = {}) {
-  if (typeof v !== 'string' || (!opts.allowEmpty && v.length === 0)) {
-    throw err('INVALID_PARAM', `${name} 必须是非空字符串`);
-  }
-  return v;
-}
-function optStr(v, name) {
-  if (v === undefined || v === null) return undefined;
-  return requireStr(v, name, { allowEmpty: true });
-}
-function requireNum(v, name, min, max) {
-  if (!isFiniteNum(v, min, max)) {
-    throw err('INVALID_PARAM', `${name} 必须是 [${min}, ${max}] 内的有限数字`);
-  }
-  return v;
-}
-function optNum(v, name, min, max) {
-  if (v === undefined || v === null) return undefined;
-  return requireNum(v, name, min, max);
-}
-function requireBool(v, name) {
-  if (typeof v !== 'boolean') throw err('INVALID_PARAM', `${name} 必须是布尔值`);
-  return v;
+function strictKeys(value, keys, label) {
+  if (!plain(value)) throw error('INVALID_PARAM', label + ' 必须是对象');
+  for (const k of Object.keys(value)) if (!keys.includes(k)) throw error('INVALID_PARAM', label + ' 含未知字段: ' + k);
 }
 
-// ---------------- 令牌 / token 管理 ----------------
-
-// 首次运行生成 256bit 随机 token（32 字节 hex），权限收紧到 0600
-function loadOrCreateToken({ rotate = false } = {}) {
+function loadKey(rotate = false) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  if (!rotate) {
-    try {
-      const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
-      if (t) {
-        try { fs.chmodSync(TOKEN_FILE, 0o600); } catch (e) { /* 权限纠正失败不致命 */ } // 修复: 已有 token 也强制纠正权限
-        return t;
-      }
-    } catch (e) { /* 不存在则生成 */ }
-  }
-  // 生成新 token（首启 or --rotate-token 强制轮换）
-  const token = randomBytes(32).toString('hex');
-  fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
-  fs.chmodSync(TOKEN_FILE, 0o600); // 原因：token 属于机密，防他人读
-  return token;
-}
-
-// 常数时间比较，防时序侧信道
-function safeTokenEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const ba = Buffer.from(a, 'utf8');
-  const bb = Buffer.from(b, 'utf8');
-  if (ba.length !== bb.length) return false;
-  return timingSafeEqual(ba, bb);
-}
-
-// ---------------- 配对码（一次性、短命，替代"复制 64 位 token 到剪贴板"） ----------------
-
-const PAIR_CODE_TTL_MS = 10 * 60 * 1000; // 10 分钟
-let pairCode = null;       // 当前有效配对码（仅存内存，不落盘、不进日志）
-let pairCodeExpiry = 0;    // 过期时间戳
-let pairCodeTimer = null;  // 过期定时器
-let pairedOnce = false;    // 是否已成功配对过（首次成功后不再自动生成配对码）
-
-// 生成 6 位 CSPRNG 配对码，打印到 stderr（不进文件/日志/stdout）
-function generatePairCode() {
-  // 用 CSPRNG 取 6 位十进制数字（避免 %10 的取模偏差）
-  const buf = randomBytes(8);
-  const num = Number(buf.readBigUInt64BE(0) % 1000000n);
-  pairCode = String(num).padStart(6, '0');
-  pairCodeExpiry = Date.now() + PAIR_CODE_TTL_MS;
-  if (pairCodeTimer) clearTimeout(pairCodeTimer);
-  pairCodeTimer = setTimeout(() => { pairCode = null; }, PAIR_CODE_TTL_MS);
-  pairCodeTimer.unref();
-  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  log('首次配对：请在 Figma 插件面板输入以下 6 位配对码（10 分钟内有效，仅一次）');
-  log('  配对码: ' + pairCode);
-  log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  return pairCode;
-}
-
-function consumePairCode(code) {
-  if (!pairCode) return false;
-  if (Date.now() > pairCodeExpiry) { pairCode = null; return false; }
-  if (typeof code !== 'string' || !safeTokenEqual(code, pairCode)) return false;
-  pairCode = null; // 单次有效，立即作废
-  if (pairCodeTimer) { clearTimeout(pairCodeTimer); pairCodeTimer = null; }
-  return true;
-}
-
-// ---------------- 审计日志（JSON Lines） ----------------
-
-function audit({ tool, args, ok, code, ms }) {
+  fs.chmodSync(CONFIG_DIR, 0o700);
+  let existing;
   try {
-    let argText = '';
-    try { argText = JSON.stringify(args || {}); } catch (e) { argText = '<unserializable>'; }
-    if (argText.length > 2000) argText = argText.slice(0, 2000) + '…'; // 防审计文件被撑爆
-    try { fs.chmodSync(AUDIT_FILE, 0o600); } catch (e) { /* 首次创建前不存在, 忽略 */ } // V7: 审计文件也 0600
-    fs.appendFileSync(AUDIT_FILE, JSON.stringify({
-      ts: new Date().toISOString(), tool, args: argText, ok, code: code || null, ms,
-    }) + '\n', 'utf8');
-    try { fs.chmodSync(AUDIT_FILE, 0o600); } catch (e) { /* ignore */ } // 写后再次确保 0600
-  } catch (e) { log('写审计日志失败', e && e.message); }
+    const info = fs.lstatSync(TOKEN_FILE);
+    if (!info.isFile() || info.isSymbolicLink()) throw error('INVALID_KEY_FILE', '密钥文件必须是普通文件');
+    const fd = fs.openSync(TOKEN_FILE, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try { existing = fs.readFileSync(fd, 'utf8').trim(); } finally { fs.closeSync(fd); }
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (!rotate && existing !== undefined) {
+    if (!KEY_RE.test(existing)) throw error('INVALID_KEY_FILE', '现有 bridge-token 不是 256 位十六进制密钥；请停服后显式轮换');
+    fs.chmodSync(TOKEN_FILE, 0o600);
+    return existing.toLowerCase();
+  }
+  const key = randomBytes(32).toString('hex');
+  const tmp = TOKEN_FILE + '.' + randomBytes(8).toString('hex') + '.tmp';
+  try {
+    fs.writeFileSync(tmp, key + '\n', { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, TOKEN_FILE);
+  } finally { try { fs.unlinkSync(tmp); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+  return key;
 }
 
-// ---------------- 限流：令牌桶（20 cmd/s） ----------------
+function audit(tool, args, ok, code, ms) {
+  // Do not persist Figma text, paint values, pairing keys or complete tool arguments.
+  try {
+    fs.appendFileSync(AUDIT_FILE, JSON.stringify({
+      ts: new Date().toISOString(), tool, ok, code: code || null, ms,
+      sessionId: args.sessionId || null, pageId: args.pageId || null, operationId: args.operationId || null,
+    }) + '\n', { mode: 0o600 });
+    fs.chmodSync(AUDIT_FILE, 0o600);
+  } catch (e) { log('审计日志写入失败: ' + e.message); }
+}
 
-let tokens = RATE_BURST;
-let lastRefill = Date.now();
+const str = (maxLength = 1024, minLength = 1) => ({ type: 'string', minLength, maxLength });
+const number = (minimum, maximum) => ({ type: 'number', minimum, maximum });
+const integer = (minimum, maximum) => ({ type: 'integer', minimum, maximum });
+const object = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
+const bool = { type: 'boolean' };
+const rgb = object({ r: number(0, 1), g: number(0, 1), b: number(0, 1), a: number(0, 1) }, ['r', 'g', 'b']);
+const matrix = { type: 'array', minItems: 2, maxItems: 2, items: { type: 'array', minItems: 3, maxItems: 3, items: { type: 'number' } } };
+const paint = object({
+  type: { type: 'string', enum: ['SOLID', 'GRADIENT_LINEAR', 'GRADIENT_RADIAL', 'GRADIENT_ANGULAR', 'GRADIENT_DIAMOND', 'IMAGE', 'VIDEO', 'EMOJI'] },
+  color: { anyOf: [rgb, { type: 'string', pattern: '^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$' }] },
+  opacity: number(0, 1), visible: bool, blendMode: str(),
+  boundVariables: object({ color: object({ type: { type: 'string', enum: ['VARIABLE_ALIAS'] }, id: str() }, ['type', 'id']) }),
+  gradientTransform: matrix,
+  gradientStops: { type: 'array', maxItems: 256, items: object({ position: number(0, 1), color: rgb }, ['position', 'color']) },
+  scaleMode: { type: 'string', enum: ['FILL', 'FIT', 'CROP', 'TILE'] },
+  imageHash: { anyOf: [str(), { type: 'null' }] }, imageTransform: matrix,
+  scalingFactor: number(0, 1e6), rotation: number(-360, 360),
+  filters: object(Object.fromEntries(['exposure', 'contrast', 'saturation', 'temperature', 'tint', 'highlights', 'shadows'].map(k => [k, number(-1, 1)]))),
+  videoHash: str(), emoji: str(),
+}, ['type']);
+const paints = { type: 'array', maxItems: 32, items: paint };
+const propsSchema = object({
+  name: str(10000, 0), x: number(-1e6, 1e6), y: number(-1e6, 1e6),
+  width: number(0.01, 1e5), height: number(0, 1e5), rotation: number(-360, 360),
+  opacity: number(0, 1), visible: bool, fills: paints, strokes: paints,
+  strokeWeight: number(0, 1e5), cornerRadius: number(0, 1e5),
+});
+const target = { sessionId: str(), pageId: str() };
+const pagination = { cursor: { type: 'string', pattern: '^(0|[1-9][0-9]*)$', maxLength: 16 }, limit: integer(1, 100) };
+const tools = {};
+function define(name, description, command, properties = {}, required = [], write = false) {
+  tools[name] = {
+    name, description, command, write,
+    inputSchema: object({ ...target, ...(write ? { operationId: str(128) } : {}), ...properties },
+      ['sessionId', 'pageId', ...(write ? ['operationId'] : []), ...required]),
+  };
+}
+tools.figma_canvas_status = {
+  name: 'figma_canvas_status', description: '读取本机桥接状态及已授权插件的真实上下文；先取得 sessionId/pageId 再调用目标工具。',
+  inputSchema: object({}),
+};
+define('figma_get_context', '分页读取当前页面顶层节点和上下文，默认每页 50 个。', 'getContext', pagination);
+define('figma_get_selection', '分页读取当前选中节点和上下文，默认每页 50 个。', 'getSelection', pagination);
+define('figma_get_node', '读取一个节点摘要及有限深度的子节点；depth 为 0–6 的整数。', 'getNodeInfo', { nodeId: str(), depth: integer(0, 6) }, ['nodeId']);
+define('figma_get_operation', '查询同一插件运行会话内写操作的真实状态；超时后先查询，禁止换 operationId 重放未知写入。', 'getOperation', { operationId: str(128) }, ['operationId']);
+define('figma_create_node', '在已确认页面创建节点；operationId 是本次写入的唯一标识，相同 ID 不重复执行。', 'createNode', {
+  type: { type: 'string', enum: ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE', 'STAR'] },
+  parentId: str(), name: str(10000, 0), x: number(-1e6, 1e6), y: number(-1e6, 1e6),
+  width: number(0.01, 1e5), height: number(0, 1e5), text: str(200000, 0), props: propsSchema,
+}, ['type'], true);
+define('figma_modify_node', '修改节点白名单属性；须提供 sessionId/pageId/operationId。', 'modifyNode', { nodeId: str(), props: propsSchema }, ['nodeId', 'props'], true);
+define('figma_delete_node', '删除目标节点；须提供 sessionId/pageId/operationId。', 'deleteNode', { nodeId: str() }, ['nodeId'], true);
+define('figma_set_text', '修改文本节点；省略 text 保留原文，可单独改字体、字号或位置。', 'setText', {
+  nodeId: str(), text: str(200000, 0), fontName: object({ family: str(), style: str() }, ['family', 'style']),
+  fontSize: number(1, 1000), x: number(-1e6, 1e6), y: number(-1e6, 1e6),
+}, ['nodeId'], true);
+tools.figma_create_node.inputSchema.allOf = [
+  { if: { properties: { type: { const: 'TEXT' } } }, then: { required: ['text'] } },
+  { if: { properties: { type: { const: 'LINE' } } }, else: { properties: { height: { minimum: 0.01 } } } },
+];
+
+function validate(value, schema, label = 'arguments') {
+  if (schema.anyOf) {
+    for (const candidate of schema.anyOf) { try { validate(value, candidate, label); return; } catch {} }
+    throw error('INVALID_PARAM', label + ' 格式不合法');
+  }
+  const valid = schema.type === 'object' ? plain(value) :
+    schema.type === 'array' ? Array.isArray(value) :
+      schema.type === 'null' ? value === null :
+        schema.type === 'integer' ? Number.isSafeInteger(value) :
+          schema.type === 'number' ? typeof value === 'number' && Number.isFinite(value) :
+            typeof value === schema.type;
+  if (!valid) throw error('INVALID_PARAM', label + ' 必须是 ' + schema.type);
+  if (schema.enum && !schema.enum.includes(value)) throw error('INVALID_PARAM', label + ' 不在允许值中');
+  if (typeof value === 'string') {
+    if ((schema.minLength !== undefined && value.length < schema.minLength) || (schema.maxLength !== undefined && value.length > schema.maxLength)) throw error('INVALID_PARAM', label + ' 长度不合法');
+    if (schema.pattern && !new RegExp(schema.pattern).test(value)) throw error('INVALID_PARAM', label + ' 格式不合法');
+  }
+  if (typeof value === 'number' && ((schema.minimum !== undefined && value < schema.minimum) || (schema.maximum !== undefined && value > schema.maximum))) throw error('INVALID_PARAM', label + ' 超出范围');
+  if (schema.type === 'array') {
+    if ((schema.minItems !== undefined && value.length < schema.minItems) || (schema.maxItems !== undefined && value.length > schema.maxItems)) throw error('INVALID_PARAM', label + ' 数量不合法');
+    value.forEach((v, i) => validate(v, schema.items, label + '[' + i + ']'));
+  }
+  if (schema.type === 'object') {
+    for (const k of schema.required || []) if (!own(value, k)) throw error('INVALID_PARAM', label + ' 缺少 ' + k);
+    for (const k of Object.keys(value)) {
+      if (!own(schema.properties, k)) throw error('INVALID_PARAM', label + ' 含未知字段: ' + k);
+      validate(value[k], schema.properties[k], label + '.' + k);
+    }
+  }
+}
+
+function normalizePaints(list) {
+  return list.map(p => {
+    const common = ['type', 'opacity', 'visible', 'blendMode', 'boundVariables'];
+    const extra = p.type === 'SOLID' ? ['color'] : p.type.startsWith('GRADIENT_') ? ['gradientTransform', 'gradientStops'] :
+      p.type === 'IMAGE' ? ['imageHash', 'scaleMode', 'imageTransform', 'scalingFactor', 'rotation', 'filters'] :
+        p.type === 'VIDEO' ? ['videoHash', 'scaleMode'] : ['emoji'];
+    strictKeys(p, [...common, ...extra], 'paint');
+    if (p.type !== 'SOLID') return p;
+    if (!own(p, 'color')) throw error('INVALID_PARAM', 'SOLID 缺少 color');
+    let c = p.color;
+    if (typeof c === 'string') {
+      let h = c.replace(/^#/, '');
+      if (h.length === 3) h = h.split('').map(x => x + x).join('');
+      c = { r: parseInt(h.slice(0, 2), 16) / 255, g: parseInt(h.slice(2, 4), 16) / 255, b: parseInt(h.slice(4, 6), 16) / 255 };
+    }
+    if (own(c, 'a') && own(p, 'opacity') && c.a !== p.opacity) throw error('INVALID_PARAM', 'color.a 与 opacity 冲突');
+    const out = { ...p, color: { r: c.r, g: c.g, b: c.b } };
+    if (own(c, 'a')) out.opacity = c.a;
+    return out;
+  });
+}
+function buildParams(spec, args) {
+  if (spec.command === 'createNode') {
+    if (args.type === 'TEXT' && !own(args, 'text')) throw error('INVALID_PARAM', 'TEXT 创建必须显式提供 text');
+    if (args.type !== 'TEXT' && own(args, 'text')) throw error('INVALID_PARAM', '只有 TEXT 创建可以提供 text');
+    if (args.type !== 'LINE' && own(args, 'height') && args.height < 0.01) throw error('INVALID_PARAM', '非 LINE 节点高度至少为 0.01');
+    for (const k of ['name', 'x', 'y', 'width', 'height']) if (own(args, k) && args.props && own(args.props, k)) throw error('INVALID_PARAM', '创建字段重复: ' + k);
+  }
+  const params = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (k === 'sessionId' || k === 'pageId' || (k === 'operationId' && spec.write)) continue;
+    params[k === 'nodeId' ? 'id' : k] = v;
+  }
+  if (params.props) {
+    params.props = { ...params.props };
+    for (const k of ['fills', 'strokes']) if (own(params.props, k)) params.props[k] = normalizePaints(params.props[k]);
+  }
+  if (own(params, 'cursor') && !Number.isSafeInteger(Number(params.cursor))) throw error('INVALID_PARAM', 'cursor 超出安全整数范围');
+  return params;
+}
+
+let bridgeKey;
+let active = null;
+let shuttingDown = false;
+let requestSeq = 0;
+const pending = new Map();
+const rpcPending = new Map();
+let tokens = 20;
+let refillAt = Date.now();
 function takeToken() {
   const now = Date.now();
-  tokens = Math.min(RATE_BURST, tokens + ((now - lastRefill) / 1000) * RATE_REFILL_PER_SEC);
-  lastRefill = now;
-  if (tokens < 1) throw err('RATE_LIMITED', '请求过频，超过 20 cmd/s');
-  tokens -= 1;
+  tokens = Math.min(20, tokens + Math.max(0, now - refillAt) / 1000 * 20);
+  refillAt = now;
+  if (tokens < 1) throw error('RATE_LIMITED', '请求超过 20 次/秒，请稍后再试');
+  tokens--;
 }
 
-// ---------------- WebSocket server 与鉴权 ----------------
-
-// 支持 --rotate-token CLI：轮换 token（旧 token 失效），用于"token 疑似泄露"时主动作废
-const rotateRequested = process.argv.includes('--rotate-token');
-const bridgeToken = loadOrCreateToken({ rotate: rotateRequested });
-if (rotateRequested) log('已轮换 token（旧 token 失效），请重新配对插件');
-
-let pluginSock = null;   // 当前已授权插件连接（同一时刻只维护一个）
-let cmdSeq = 0;
-const pending = new Map(); // id -> {resolve, reject, timer, tool, started}
-
-const httpServer = createServer((req, res) => {
-  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-  res.end('figma-canvas-writer ws server');
-});
-
-const wss = new WebSocketServer({ server: httpServer, path: WS_PATH, maxPayload: MAX_MSG_BYTES, perMessageDeflate: false });
-
-function safeSend(sock, obj) {
-  if (sock && sock.readyState === WebSocket.OPEN) {
-    try { sock.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
-  }
-  return false;
+function failureFor(rec, code, message) {
+  return error(code, message, rec.write ? {
+    state: 'unknown', details: { operationId: rec.operationId, sessionId: rec.sessionId, pageId: rec.pageId },
+  } : {});
 }
-
-function handlePair(client, msg) {
-  // 配对码换取 token：6 位一次性配对码 → 常数时间比较 → 通过后经 127.0.0.1 WS 帧签发真 token
-  if (!consumePairCode(msg.code)) {
-    safeSend(client, { type: 'pair_ack', ok: false, error: { code: 'PAIR_FAILED', message: '配对码无效、已过期或已使用。请重启桥接生成新配对码。' } });
-    return;
-  }
-  pairedOnce = true;
-  safeSend(client, { type: 'pair_ack', ok: true, token: bridgeToken, protocol: PROTOCOL });
-  log('配对成功：已向插件签发 token');
-}
-
-function handleAuth(client, msg) {
-  // 原因：token 鉴权是插件身份的唯一凭据，只认白名单协议版本 + 常数时间比较
-  if (msg.protocol !== PROTOCOL) {
-    safeSend(client, { type: 'auth_ack', ok: false, error: { code: 'AUTH_FAILED', message: `协议版本不匹配（期望 ${PROTOCOL}）` } });
-    return;
-  }
-  if (typeof msg.token !== 'string' || !safeTokenEqual(msg.token, bridgeToken)) {
-    safeSend(client, { type: 'auth_ack', ok: false, error: { code: 'AUTH_FAILED', message: 'token 无效，请将插件面板 token 与本机 ~/.figma-canvas-writer/bridge-token（或环境变量 FIGMA_BRIDGE_HOME 指定） 保持一致' } });
-    return;
-  }
-  // 同一时刻只保留一个授权插件：新连接鉴权通过后踢掉旧的
-  if (pluginSock && pluginSock !== client && pluginSock.readyState === WebSocket.OPEN) {
-    try { pluginSock.close(); } catch (e) { /* ignore */ }
-  }
-  client.authed = true;
-  client.lastSeen = Date.now();
-  if (client.authTimeout) { clearTimeout(client.authTimeout); client.authTimeout = null; } // 修复: 鉴权成功后清掉 auth 超时定时器, 防止误关
-  pluginSock = client;
-  safeSend(client, { type: 'auth_ack', ok: true, protocol: PROTOCOL });
-  log(`插件已鉴权通过 (${client.remoteAddress})`);
-}
-
-function handleResp(client, msg) {
-  if (client !== pluginSock) return; // L1: 响应必须来自当前授权插件, 防止伪造
-  const rec = msg.id !== undefined ? pending.get(msg.id) : undefined;
-  if (!rec) return; // 非本进程发起的请求 / 已超时
-  pending.delete(msg.id);
+function settle(id, err, data) {
+  const rec = pending.get(id);
+  if (!rec) return;
+  pending.delete(id);
   clearTimeout(rec.timer);
-  // 原因：审计统一在 CallTool 入口做一次（含工具名/耗时），这里不再重复记
-  if (msg.ok === true) {
-    rec.resolve(msg.data);
-  } else {
-    const e = (msg.error && typeof msg.error === 'object')
-      ? err(String(msg.error.code || 'PLUGIN_ERROR'), String(msg.error.message || '插件执行失败'))
-      : err('PLUGIN_ERROR', '插件返回未知错误');
-    rec.reject(e);
+  if (rec.signal && rec.abort) rec.signal.removeEventListener('abort', rec.abort);
+  if (err) rec.reject(err); else rec.resolve(data);
+}
+function drop(client, code = 'PLUGIN_DISCONNECTED', message = '插件已断开连接', closeCode = 4001) {
+  clearTimeout(client.authTimer);
+  if (active === client) active = null;
+  client.authed = false;
+  for (const [id, rec] of pending) if (rec.client === client) settle(id, failureFor(rec, code, message));
+  if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
+    try { client.close(closeCode, code); } catch { client.terminate(); }
+    const deadline = setTimeout(() => client.terminate(), 300);
+    deadline.unref();
   }
 }
-
-function startWsServer() {
-  wss.on('connection', (client, req) => {
-    // 回环白名单校验（绑定双栈 :: 后必须校验，只放行本机回环，拒绝局域网/远程）
-    client.remoteAddress = req.socket ? req.socket.remoteAddress : 'unknown';
-    const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
-    if (!LOOPBACK.has(client.remoteAddress)) {
-      log(`拒绝非回环连接: ${client.remoteAddress}`);
-      try { client.close(4000, 'localhost only'); } catch (e) { /* ignore */ }
-      return;
+function sendPlain(client, msg) {
+  if (client.readyState !== WebSocket.OPEN) return;
+  client.send(JSON.stringify(msg));
+}
+function sendFrame(client, payload, callback) {
+  const seq = client.sendSeq + 1;
+  const frame = { type: 'frame', connectionId: client.connectionId, seq, payload };
+  frame.mac = sign(bridgeKey, frameProof('server', frame.connectionId, seq, payload));
+  const text = JSON.stringify(frame);
+  if (Buffer.byteLength(text) > MAX_MSG_BYTES) throw error('MSG_TOO_LARGE', '签名命令超过 256KB 上限');
+  client.sendSeq = seq;
+  client.send(text, callback);
+}
+function sendCommand(command, params, args, signal) {
+  const client = active;
+  if (!client || !client.authed || client.readyState !== WebSocket.OPEN) return Promise.reject(error('NO_PLUGIN', '请在 Figma Desktop 运行插件并连接本机桥接'));
+  if (args.sessionId !== client.context.sessionId || args.pageId !== client.context.pageId) return Promise.reject(error('STALE_CONTEXT', '目标会话或页面已变化，请重新读取状态并确认目标'));
+  if (signal?.aborted) return Promise.reject(error('CANCELLED', '调用已取消'));
+  if (pending.size >= MAX_PENDING) return Promise.reject(error('BUSY', '在途请求过多'));
+  takeToken();
+  const id = client.connectionId + ':' + (++requestSeq);
+  const payload = {
+    type: 'cmd', id, command, params, sessionId: args.sessionId, pageId: args.pageId,
+    ...(WRITE_COMMANDS.has(command) ? { operationId: args.operationId } : {}),
+  };
+  return new Promise((resolve, reject) => {
+    const rec = {
+      client, resolve, reject, signal, write: WRITE_COMMANDS.has(command),
+      sessionId: args.sessionId, pageId: args.pageId, operationId: args.operationId,
+    };
+    rec.timer = setTimeout(() => settle(id, failureFor(rec, 'TIMEOUT', '插件未在期限内回复；写入结果可能未知，请查询 operationId')), CMD_TIMEOUT_MS);
+    rec.abort = () => settle(id, failureFor(rec, 'CANCELLED', '调用已取消；已开始的写入仍可能完成'));
+    if (signal) signal.addEventListener('abort', rec.abort, { once: true });
+    pending.set(id, rec);
+    try { sendFrame(client, payload, e => { if (e) drop(client, 'SEND_FAILED', e.message); }); }
+    catch (e) {
+      if (e.code === 'MSG_TOO_LARGE') settle(id, e);
+      else drop(client, 'SEND_FAILED', e.message);
     }
-    client.authed = false;
-    client.lastSeen = null;
-    client.isAlive = true; // 心跳存活标记: 每轮 ping 前置 false, 收到 pong 置回 true
-    client.on('pong', () => { client.isAlive = true; client.lastSeen = Date.now(); }); // 修复: 真正监听 pong, 假死才能被检测
-    // 修复: 未鉴权连接 10 秒内不发 auth 帧则关闭, 防止 TCP 挂起耗尽资源
-    client.authTimeout = setTimeout(() => {
-      if (!client.authed) { try { client.close(4002, 'auth timeout'); } catch (e) { /* ignore */ } }
-    }, 10000);
+  });
+}
 
-    client.on('message', (buf) => {
-      if (buf && Buffer.byteLength(buf) > MAX_MSG_BYTES) {
-        log('收到超限消息（忽略）');
+function serveHttp(req, res) {
+  res.writeHead(404, { 'content-type': 'text/plain', 'connection': 'close' });
+  res.end('Not found');
+}
+const httpServers = [createServer(serveHttp), createServer(serveHttp)];
+const listenHosts = [];
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MSG_BYTES, perMessageDeflate: false });
+function handleUpgrade(req, socket, head) {
+  // Figma Desktop plugin iframes may have an opaque (null) Origin.
+  const origin = req.headers.origin;
+  const allowedOrigin = origin === undefined || origin === 'null' || origin === 'https://www.figma.com' || origin === 'https://figma.com';
+  const allowedHost = [HOST + ':' + PORT, 'localhost:' + PORT, '[' + IPV6_HOST + ']:' + PORT].includes(req.headers.host);
+  if (!bridgeKey || ![HOST, IPV6_HOST].includes(req.socket.remoteAddress) || !allowedHost || !allowedOrigin || req.url !== WS_PATH || wss.clients.size >= 8) {
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, client => wss.emit('connection', client));
+}
+for (const server of httpServers) server.on('upgrade', handleUpgrade);
+function listen(server, host) {
+  return new Promise((resolve, reject) => {
+    const failed = e => { server.removeListener('listening', ready); reject(e); };
+    const ready = () => {
+      server.removeListener('error', failed);
+      listenHosts.push(server.address().address);
+      resolve();
+    };
+    server.once('error', failed);
+    server.once('listening', ready);
+    server.listen({ port: PORT, host, ipv6Only: host === IPV6_HOST });
+  });
+}
+function closeListeners() {
+  return Promise.all(httpServers.map(server => new Promise(resolve => {
+    if (!server.listening) { resolve(); return; }
+    server.close(resolve);
+  })));
+}
+wss.on('connection', client => {
+  client.authed = false;
+  client.serverNonce = randomBytes(32).toString('hex');
+  client.recvSeq = 0;
+  client.sendSeq = 0;
+  client.alive = true;
+  client.authTimer = setTimeout(() => drop(client, 'AUTH_TIMEOUT', '鉴权超时'), 10000);
+  client.on('pong', () => { client.alive = true; client.lastSeen = Date.now(); });
+  client.on('error', () => drop(client));
+  client.on('close', () => drop(client));
+  client.on('message', (bytes, binary) => {
+    try {
+      if (binary) throw error('BAD_FRAME', '不接受二进制消息');
+      const msg = JSON.parse(bytes.toString('utf8'));
+      if (!client.authed) {
+        strictKeys(msg, ['type', 'protocol', 'serverNonce', 'clientNonce', 'context', 'proof'], 'auth');
+        if (msg.type !== 'auth' || msg.protocol !== AUTH_PROTOCOL || msg.serverNonce !== client.serverNonce ||
+            typeof msg.clientNonce !== 'string' || !KEY_RE.test(msg.clientNonce)) throw error('AUTH_FAILED', '鉴权失败');
+        const context = normalizeContext(msg.context);
+        if (!verify(bridgeKey, authProof('client-auth', client.serverNonce, msg.clientNonce, context), msg.proof)) throw error('AUTH_FAILED', '鉴权失败');
+        if (active && active !== client) {
+          sendPlain(client, { type: 'auth_ack', ok: false, error: { code: 'PLUGIN_BUSY', message: '另一个插件已获授权，请先断开该插件' } });
+          drop(client, 'PLUGIN_BUSY', '已有插件连接');
+          return;
+        }
+        client.context = context;
+        client.connectionId = randomBytes(32).toString('hex');
+        client.authed = true;
+        client.lastSeen = Date.now();
+        clearTimeout(client.authTimer);
+        active = client;
+        sendPlain(client, {
+          type: 'auth_ack', ok: true, protocol: AUTH_PROTOCOL, connectionId: client.connectionId,
+          proof: sign(bridgeKey, authProof('server-auth', client.serverNonce, msg.clientNonce, context, client.connectionId)),
+        });
         return;
       }
-      let msg;
-      try { msg = JSON.parse(buf.toString('utf8')); } catch (e) { return; }
-      if (!isPlainObject(msg)) return;
-      if (msg.type === 'auth') handleAuth(client, msg);
-      else if (msg.type === 'pair') handlePair(client, msg);
-      else if (msg.type === 'resp') handleResp(client, msg);
-      // 其它消息类型一律忽略（原因：仅接受白名单协议消息）
-    });
-    client.on('error', () => { /* ignore */ });
-    client.on('close', () => {
-      if (client.authTimeout) { clearTimeout(client.authTimeout); client.authTimeout = null; } // N2: 连接断开即清 auth 超时
-      if (pluginSock !== client) return; // N1: 只清理"当前授权插件"的断连, 不误伤新连接/其他连接的在途命令
-      pluginSock = null;
-      // 修复: 插件断连时立即失败所有在途命令, 不让 MCP 调用方白等超时
-      for (const [id, rec] of pending) {
-        clearTimeout(rec.timer);
-        pending.delete(id);
-        rec.reject(err('PLUGIN_DISCONNECTED', '插件连接已断开'));
+      strictKeys(msg, ['type', 'connectionId', 'seq', 'payload', 'mac'], 'frame');
+      if (msg.type !== 'frame' || msg.connectionId !== client.connectionId || !Number.isSafeInteger(msg.seq) ||
+          msg.seq !== client.recvSeq + 1 || !plain(msg.payload) ||
+          !verify(bridgeKey, frameProof('client', msg.connectionId, msg.seq, msg.payload), msg.mac)) throw error('BAD_FRAME', '签名或序号校验失败');
+      client.recvSeq = msg.seq;
+      client.lastSeen = Date.now();
+      const resp = msg.payload;
+      strictKeys(resp, ['type', 'id', 'ok', 'data', 'error'], 'resp');
+      if (resp.type !== 'resp' || typeof resp.id !== 'string' || typeof resp.ok !== 'boolean') throw error('BAD_FRAME', '响应格式不合法');
+      const rec = pending.get(resp.id);
+      if (!rec || rec.client !== client) return; // Late results are reconciled via getOperation.
+      if (resp.ok) settle(resp.id, null, resp.data);
+      else {
+        strictKeys(resp.error, ['code', 'message', 'state', 'affectedNodeIds', 'details'], 'error');
+        if (typeof resp.error.code !== 'string' || typeof resp.error.message !== 'string') throw error('BAD_FRAME', '错误结果格式不合法');
+        settle(resp.id, error(resp.error.code, resp.error.message, resp.error));
       }
-    });
-  });
-
-  // 心跳保活：每 30s ping 前先置 isAlive=false, 收不到 pong 则判定假死并 terminate
-  const heartbeat = setInterval(() => {
-    const s = pluginSock;
-    if (!s || s.readyState !== WebSocket.OPEN || !s.authed) return;
-    if (s.isAlive === false) { try { s.terminate(); } catch (e) { /* ignore */ } return; } // 上一周期未 pong, 假死
-    s.isAlive = false;
-    try { s.ping(); } catch (e) { try { s.terminate(); } catch (e2) { /* ignore */ } }
-  }, 30000);
-  heartbeat.unref();
-
-  httpServer.listen(PORT, HOST, () => {
-    log(`WebSocket server 已监听 ${HOST}:${PORT}${WS_PATH}（token 文件: ${TOKEN_FILE}）`);
-  });
-  httpServer.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      log(`错误: 端口 ${PORT} 已被占用。请先关闭其他 figma-canvas-writer 桥接实例（可能是多个 agent 同时 spawn 导致），或设置不同 FIGMA_BRIDGE_PORT。`);
-      process.exit(1);
-    } else {
-      log(`WebSocket server 启动失败: ${e.message}`);
-      process.exit(1);
+    } catch (e) {
+      if (!client.authed) sendPlain(client, { type: 'auth_ack', ok: false, error: { code: 'AUTH_FAILED', message: '鉴权失败，请核对本机配对密钥' } });
+      drop(client, e.code || 'BAD_FRAME', e.message);
     }
   });
+  sendPlain(client, { type: 'challenge', protocol: AUTH_PROTOCOL, serverNonce: client.serverNonce });
+});
+const heartbeat = setInterval(() => {
+  if (!active) return;
+  if (!active.alive) { drop(active, 'PLUGIN_DISCONNECTED', '插件心跳丢失'); return; }
+  active.alive = false;
+  try { active.ping(); } catch { drop(active); }
+}, 15000);
+heartbeat.unref();
+
+function toolError(e) {
+  const result = { code: e.code || 'BRIDGE_ERROR', message: e.message || String(e) };
+  for (const key of ['state', 'affectedNodeIds', 'details']) if (own(e, key)) result[key] = e[key];
+  return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: result }) }], isError: true };
 }
-
-// ---------------- 转发：MCP 工具 -> WS 命令 -> 等插件响应 ----------------
-
-function sendCommand(command, params, argsForAudit) {
-  if (!pluginSock || pluginSock.readyState !== WebSocket.OPEN || !pluginSock.authed) {
-    return Promise.reject(err('NO_PLUGIN', 'Figma 插件未连接或未授权（请先在 Figma 里运行并授权插件）'));
-  }
-  takeToken(); // 可能抛 RATE_LIMITED
-  const id = ++cmdSeq;
-  const payload = JSON.stringify({ type: 'cmd', id, command, params });
-  if (Buffer.byteLength(payload, 'utf8') > MAX_MSG_BYTES) {
-    return Promise.reject(err('MSG_TOO_LARGE', '命令消息超过 256KB 上限'));
-  }
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(err('TIMEOUT', `插件 ${CMD_TIMEOUT_MS}ms 内未响应 (${command})`));
-    }, CMD_TIMEOUT_MS);
-    pending.set(id, {
-      resolve, reject, timer,
-      tool: command, args: argsForAudit || {}, started: Date.now(),
-    });
-    pluginSock.send(payload, (e) => {
-      if (e) {
-        clearTimeout(timer);
-        pending.delete(id);
-        reject(err('SEND_FAILED', e.message));
-      }
-    });
-  });
-}
-
-// ---------------- 输入校验（桥接侧白名单，防御纵深，与插件侧一致） ----------------
-
-function validatePaints(v, name) {
-  if (!Array.isArray(v)) throw err('INVALID_PARAM', `${name} 必须是数组`);
-  if (v.length > 32) throw err('INVALID_PARAM', `${name} 数量超过 32`);
-  const out = [];
-  for (const paint of v) {
-    if (!isPlainObject(paint)) throw err('INVALID_PARAM', `${name} 元素必须是普通对象`);
-    if (typeof paint.type !== 'string' || !PAINT_TYPES.has(paint.type)) {
-      throw err('INVALID_PARAM', `${name} 元素 type 非法`);
-    }
-    if (paint.type === 'SOLID') {
-      // 支持 {r,g,b} 对象(0..1) 或 "#RRGGBB"/"#RGB" hex 字符串(自动转对象, 与插件侧 validatePaints 一致)
-      let c = paint.color;
-      if (typeof c === 'string') c = hexToRgb01(c);
-      if (!isPlainObject(c)) throw err('INVALID_PARAM', 'SOLID 填充需要 color');
-      for (const ch of ['r', 'g', 'b']) {
-        if (!isFiniteNum(c[ch], 0, 1)) throw err('INVALID_PARAM', `color.${ch} 需在 [0,1]`);
-      }
-      if (c.a !== undefined && !isFiniteNum(c.a, 0, 1)) {
-        throw err('INVALID_PARAM', 'color.a 需在 [0,1]');
-      }
-      out.push({ type: 'SOLID', color: { r: c.r, g: c.g, b: c.b, a: c.a === undefined ? 1 : c.a } });
-    } else {
-      out.push(JSON.parse(JSON.stringify(paint)));
-    }
-  }
-  return out;
-}
-
-// hex 颜色字符串转 {r,g,b}(0..1 浮点); 与插件侧 hexToRgb01 保持一致
-function hexToRgb01(hex) {
-  if (typeof hex !== 'string') throw err('INVALID_PARAM', 'color 必须是字符串或 {r,g,b} 对象');
-  const m = hex.trim().match(/^#?([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/);
-  if (!m) throw err('INVALID_PARAM', `非法 hex 颜色: ${hex}（需 #RRGGBB 或 #RGB）`);
-  let h = m[1];
-  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
-  return {
-    r: parseInt(h.slice(0, 2), 16) / 255,
-    g: parseInt(h.slice(2, 4), 16) / 255,
-    b: parseInt(h.slice(4, 6), 16) / 255,
-  };
-}
-
-function validateModifyProps(props) {
-  if (!isPlainObject(props)) throw err('INVALID_PARAM', 'props 必须是普通对象');
-  const out = {};
-  for (const key of Object.keys(props)) {
-    if (!MODIFY_PROPS.has(key)) throw err('INVALID_PARAM', `属性不在白名单内: ${key}`);
-    const v = props[key];
-    switch (key) {
-      case 'name': out.name = requireStr(v, 'name', { allowEmpty: true }); break;
-      case 'x': out.x = requireNum(v, 'x', -1e6, 1e6); break;
-      case 'y': out.y = requireNum(v, 'y', -1e6, 1e6); break;
-      case 'width': out.width = requireNum(v, 'width', 0, 1e5); break;
-      case 'height': out.height = requireNum(v, 'height', 0, 1e5); break;
-      case 'rotation': out.rotation = requireNum(v, 'rotation', -360, 360); break; // 角度
-      case 'opacity': out.opacity = requireNum(v, 'opacity', 0, 1); break;
-      case 'visible': out.visible = requireBool(v, 'visible'); break;
-      case 'strokeWeight': out.strokeWeight = requireNum(v, 'strokeWeight', 0, 1e5); break;
-      case 'cornerRadius': out.cornerRadius = requireNum(v, 'cornerRadius', 0, 1e5); break;
-      case 'fills': out.fills = validatePaints(v, 'fills'); break;
-      case 'strokes': out.strokes = validatePaints(v, 'strokes'); break;
-    }
-  }
-  return out;
-}
-
-// 按工具把入参规整成插件能直接消费的 {command, params}，并做范围/类型校验
-function buildCommand(toolName, a) {
-  switch (toolName) {
-    case 'figma_get_selection':
-      return { command: 'getSelection', params: {} };
-
-    case 'figma_get_node': {
-      const params = { id: requireStr(a.nodeId, 'nodeId') };
-      const depth = optNum(a.depth, 'depth', 0, 6);
-      if (depth !== undefined) params.depth = depth;
-      return { command: 'getNodeInfo', params };
-    }
-
-    case 'figma_create_node': {
-      const type = requireStr(a.type, 'type');
-      if (!CREATE_TYPES.includes(type)) {
-        throw err('INVALID_PARAM', `不支持创建的类型: ${type}（允许: ${CREATE_TYPES.join('/')}）`);
-      }
-      const params = { type };
-      const parentId = optStr(a.parentId, 'parentId');
-      if (parentId !== undefined) params.parentId = parentId;
-      const name = optStr(a.name, 'name');
-      if (name !== undefined) params.name = name;
-      const x = optNum(a.x, 'x', -1e6, 1e6);
-      if (x !== undefined) params.x = x;
-      const y = optNum(a.y, 'y', -1e6, 1e6);
-      if (y !== undefined) params.y = y;
-      const w = optNum(a.width, 'width', 0, 1e5);
-      if (w !== undefined) params.width = w;
-      const h = optNum(a.height, 'height', 0, 1e5);
-      if (h !== undefined) params.height = h;
-      if (type === 'TEXT') {
-        params.text = a.text === undefined ? '' : requireStr(a.text, 'text', { allowEmpty: true });
-      }
-      return { command: 'createNode', params };
-    }
-
-    case 'figma_modify_node':
-      return {
-        command: 'modifyNode',
-        params: { id: requireStr(a.nodeId, 'nodeId'), props: validateModifyProps(a.props) },
-      };
-
-    case 'figma_delete_node':
-      return { command: 'deleteNode', params: { id: requireStr(a.nodeId, 'nodeId') } };
-
-    case 'figma_set_text': {
-      const params = { id: requireStr(a.nodeId, 'nodeId') };
-      params.text = a.text === undefined ? '' : requireStr(a.text, 'text', { allowEmpty: true });
-      if (a.fontName !== undefined && a.fontName !== null) {
-        if (!isPlainObject(a.fontName) ||
-            typeof a.fontName.family !== 'string' || typeof a.fontName.style !== 'string') {
-          throw err('INVALID_PARAM', 'fontName 必须是 {family, style} 字符串对象');
-        }
-        params.fontName = { family: a.fontName.family, style: a.fontName.style };
-      }
-      const fontSize = optNum(a.fontSize, 'fontSize', 1, 1000);
-      if (fontSize !== undefined) params.fontSize = fontSize;
-      const x = optNum(a.x, 'x', -1e6, 1e6);
-      if (x !== undefined) params.x = x;
-      const y = optNum(a.y, 'y', -1e6, 1e6);
-      if (y !== undefined) params.y = y;
-      return { command: 'setText', params };
-    }
-
-    default:
-      throw err('UNKNOWN_TOOL', `未知工具: ${toolName}`);
-  }
-}
-
-// ---------------- MCP 工具定义 ----------------
-
-const TOOL_SCHEMAS = {
-  figma_canvas_status: {
-    name: 'figma_canvas_status',
-    description: '查询 Figma Canvas Writer 桥接与 Figma 插件的连接状态（插件是否连上、是否鉴权通过、上次心跳时间）。',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  },
-  figma_create_node: {
-    name: 'figma_create_node',
-    description: '在 Figma 当前页（或指定 FRAME 父节点内）创建一个节点。type 支持 RECTANGLE/ELLIPSE/TEXT/FRAME/LINE；TEXT 需带 text；可传 name/x/y/width/height。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        type: { type: 'string', enum: ['RECTANGLE', 'ELLIPSE', 'TEXT', 'FRAME', 'LINE'], description: '要创建的节点类型' },
-        parentId: { type: 'string', description: '目标 FRAME 父节点 id（缺省=当前页）' },
-        name: { type: 'string', description: '节点名称' },
-        x: { type: 'number', description: 'X（FRAME 内为相对坐标）' },
-        y: { type: 'number', description: 'Y（FRAME 内为相对坐标）' },
-        width: { type: 'number', description: '宽度' },
-        height: { type: 'number', description: '高度' },
-        text: { type: 'string', description: 'TEXT 类型必填：文本内容' },
-      },
-      required: ['type'],
-      additionalProperties: false,
-    },
-  },
-  figma_modify_node: {
-    name: 'figma_modify_node',
-    description: '修改已有节点属性。仅允许白名单属性：name/x/y/width/height/rotation(度)/opacity/visible/fills/strokes/strokeWeight/cornerRadius。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        nodeId: { type: 'string', description: '目标节点 id' },
-        props: {
-          type: 'object',
-          description: '要修改的属性集合（仅白名单）',
-          additionalProperties: true,
-        },
-      },
-      required: ['nodeId', 'props'],
-      additionalProperties: false,
-    },
-  },
-  figma_delete_node: {
-    name: 'figma_delete_node',
-    description: '删除画布上的一个节点。',
-    inputSchema: {
-      type: 'object',
-      properties: { nodeId: { type: 'string', description: '要删除的节点 id' } },
-      required: ['nodeId'],
-      additionalProperties: false,
-    },
-  },
-  figma_set_text: {
-    name: 'figma_set_text',
-    description: '改写一个 TEXT 节点的文本（自动加载字体）；可选改字体/字号/位置。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        nodeId: { type: 'string', description: 'TEXT 节点 id' },
-        text: { type: 'string', description: '新文本内容' },
-        fontName: { type: 'object', properties: { family: { type: 'string' }, style: { type: 'string' } }, description: '目标字体（缺省=沿用当前字体）' },
-        fontSize: { type: 'number', description: '字号（1-1000）' },
-        x: { type: 'number' },
-        y: { type: 'number' },
-      },
-      required: ['nodeId'],
-      additionalProperties: false,
-    },
-  },
-  figma_get_node: {
-    name: 'figma_get_node',
-    description: '读取节点信息（位置/尺寸/旋转/可见性/文本等），返回 JSON。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        nodeId: { type: 'string', description: '目标节点 id' },
-        depth: { type: 'number', description: '递归子节点深度（0-6，缺省 3）' },
-      },
-      required: ['nodeId'],
-      additionalProperties: false,
-    },
-  },
-  figma_get_selection: {
-    name: 'figma_get_selection',
-    description: '读取 Figma 当前选中的节点列表信息。',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  },
-};
-
-function statusInfo() {
-  const sock = pluginSock;
-  const connected = !!sock && sock.readyState === WebSocket.OPEN;
-  return {
-    connected,
-    authorized: connected && !!sock.authed,
-    lastSeen: (connected && sock.lastSeen) ? new Date(sock.lastSeen).toISOString() : null,
-    bridge: { host: HOST, port: PORT, path: WS_PATH, protocol: PROTOCOL },
-    // 不返回 tokenFile 绝对路径（V9: 避免泄露含用户名的路径）
-  };
-}
-
-// ---------------- MCP stdio（手写 JSON-RPC 2.0 over stdio，无 SDK 依赖） ----------------
-
-const MCP_PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'figma-canvas-writer', version: '1.0.0' };
-
-// tools/list 与 tools/call 的处理器（复用原有业务逻辑，仅换 JSON-RPC 外壳）
-async function handleListTools() {
-  return { tools: Object.values(TOOL_SCHEMAS) };
-}
-
-async function handleCallTool(toolName, rawArgs) {
+async function callTool(name, args, signal) {
   const started = Date.now();
-  const isStatus = toolName === 'figma_canvas_status';
-
   try {
-    if (isStatus) {
-      try { takeToken(); } catch (e) { throw e; }
-      const info = statusInfo();
-      if (info.authorized) {
+    const spec = tools[name];
+    if (!spec) throw error('UNKNOWN_TOOL', '未知工具: ' + name);
+    validate(args, spec.inputSchema);
+    let data;
+    if (name === 'figma_canvas_status') {
+      const client = active;
+      data = { connected: !!client, authorized: false, context: client?.context || null, bridge: { host: 'localhost', listenHosts: [...listenHosts], port: PORT, path: WS_PATH, protocol: AUTH_PROTOCOL } };
+      if (client) {
         try {
-          const pingData = await sendCommand('ping', {}, {});
-          info.ping = pingData;
+          data.ping = await sendCommand('ping', {}, client.context, signal);
+          data.authorized = active === client && client.authed;
+          data.connected = data.authorized;
+          if (plain(data.ping)) data.context = normalizeContext(data.ping.context || data.ping);
         } catch (e) {
-          info.ping = null;
-          info.pingError = (e && e.message) || 'ping 失败';
+          data.authorized = false;
+          data.pingError = { code: e.code || 'PLUGIN_ERROR', message: e.message };
+          data.connected = active === client && client.readyState === WebSocket.OPEN;
         }
-      }
-      audit({ tool: toolName, args: {}, ok: true, code: null, ms: Date.now() - started });
-      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, data: info }) }], isError: false };
-    }
-
-    if (!Object.prototype.hasOwnProperty.call(TOOL_SCHEMAS, toolName)) {
-      throw err('UNKNOWN_TOOL', `未知工具: ${toolName}`);
-    }
-    const { command, params } = buildCommand(toolName, rawArgs);
-    if (!COMMAND_WHITELIST.has(command)) {
-      throw err('INVALID_PARAM', `命令不在白名单: ${command}`);
-    }
-    const data = await sendCommand(command, params, rawArgs);
-    audit({ tool: toolName, args: rawArgs, ok: true, code: null, ms: Date.now() - started });
+      } else takeToken();
+    } else data = await sendCommand(spec.command, buildParams(spec, args), args, signal);
+    audit(name, args, true, null, Date.now() - started);
     return { content: [{ type: 'text', text: JSON.stringify({ ok: true, data }) }], isError: false };
   } catch (e) {
-    const code = (e && e.code) ? e.code : 'BRIDGE_ERROR';
-    const message = (e && e.message) ? e.message : String(e);
-    audit({ tool: toolName, args: rawArgs, ok: false, code, ms: Date.now() - started });
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code, message } }) }],
-      isError: true,
-    };
+    if (own(tools, name) && tools[name].write && !own(e, 'state')) e.state = 'not_started';
+    audit(name, args, false, e.code, Date.now() - started);
+    return toolError(e);
   }
 }
 
-// 手写 JSON-RPC 2.0 over stdio：逐行读 stdin，stdout 逐行回响应
-function startStdioServer() {
-  const rl = createInterface({ input: process.stdin, terminal: false });
-
-  rl.on('line', (line) => {
-    if (!line || !line.trim()) return; // 忽略空行
-    let msg;
-    try { msg = JSON.parse(line); } catch (e) { return; } // 非法 JSON 忽略，不崩溃
-    if (!msg || typeof msg !== 'object') return;
-    // 通知类（无 id）不响应
-    if (msg.method === 'notifications/initialized' || msg.method === 'notifications/cancelled') return;
-    if (msg.id === undefined || msg.id === null) return;
-
-    dispatch(msg).then((result) => {
-      writeStdout({ jsonrpc: '2.0', id: msg.id, result });
-    }).catch((e) => {
-      writeStdout({
-        jsonrpc: '2.0', id: msg.id,
-        error: { code: -32603, message: (e && e.message) ? e.message : String(e) },
-      });
-    });
-  });
-
-  rl.on('close', () => {
-    // stdio(MCP 通道)关闭 = agent 不再调用工具, 但 WS server 必须继续常驻供插件连接
-    // 不退出进程, 只记录(插件可独立于 stdio 连接)
-    log('stdio(MCP 通道)已关闭，WS server 继续运行供插件连接');
-  });
+let lifecycle = 'new';
+let negotiatedVersion;
+function rpcError(code, message, id = null) { return { jsonrpc: '2.0', id, error: { code, message } }; }
+const validId = id => typeof id === 'string' || (typeof id === 'number' && Number.isSafeInteger(id));
+function checkParams(params, allowed, required = []) {
+  strictKeys(params, [...allowed, '_meta'], 'params');
+  for (const k of required) if (!own(params, k)) throw error('INVALID_PARAM', 'params 缺少 ' + k);
+  if (own(params, '_meta') && !plain(params._meta)) throw error('INVALID_PARAM', '_meta 必须是对象');
 }
-
-async function dispatch(msg) {
-  const method = msg.method;
-  const params = (msg.params && typeof msg.params === 'object' && !Array.isArray(msg.params)) ? msg.params : {};
-  switch (method) {
-    case 'initialize':
-      return {
-        protocolVersion: MCP_PROTOCOL_VERSION,
-        capabilities: { tools: {} },
-        serverInfo: SERVER_INFO,
-      };
-    case 'ping':
-      return {};
-    case 'tools/list':
-      return handleListTools();
-    case 'tools/call': {
-      const toolName = typeof params.name === 'string' ? params.name : '';
-      const rawArgs = isPlainObject(params.arguments) ? params.arguments : {};
-      return handleCallTool(toolName, rawArgs);
+async function dispatch(msg, signal) {
+  const params = msg.params === undefined ? {} : msg.params;
+  if (!plain(params)) throw error('INVALID_PARAM', 'params 必须是对象');
+  switch (msg.method) {
+    case 'initialize': {
+      if (lifecycle !== 'new') throw error('INVALID_REQUEST', '连接已初始化');
+      checkParams(params, ['protocolVersion', 'capabilities', 'clientInfo'], ['protocolVersion', 'capabilities', 'clientInfo']);
+      if (typeof params.protocolVersion !== 'string' || !plain(params.capabilities) || !plain(params.clientInfo) ||
+          typeof params.clientInfo.name !== 'string' || typeof params.clientInfo.version !== 'string') throw error('INVALID_PARAM', 'initialize 参数不合法');
+      negotiatedVersion = SUPPORTED_VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : SUPPORTED_VERSIONS.at(-1);
+      lifecycle = 'initializing';
+      return { protocolVersion: negotiatedVersion, capabilities: { tools: {} }, serverInfo: SERVER_INFO };
     }
-    default:
-      throw err('METHOD_NOT_FOUND', `未知方法: ${method}`);
+    case 'ping': checkParams(params, []); return {};
+    case 'tools/list':
+      if (lifecycle !== 'ready') throw error('NOT_INITIALIZED', '请先完成 initialize 与 notifications/initialized');
+      checkParams(params, ['cursor']);
+      if (own(params, 'cursor')) throw error('INVALID_PARAM', '本服务工具清单不支持分页 cursor');
+      return { tools: Object.values(tools).map(({ command, write, ...spec }) => spec) };
+    case 'tools/call':
+      if (lifecycle !== 'ready') throw error('NOT_INITIALIZED', '请先完成 initialize 与 notifications/initialized');
+      checkParams(params, ['name', 'arguments'], ['name']);
+      if (typeof params.name !== 'string' || (own(params, 'arguments') && !plain(params.arguments))) throw error('INVALID_PARAM', '工具名称或 arguments 不合法');
+      if (!own(tools, params.name)) throw error('INVALID_PARAM', '未知工具: ' + params.name);
+      return callTool(params.name, params.arguments || {}, signal);
+    default: throw error('METHOD_NOT_FOUND', '未知方法: ' + msg.method);
   }
 }
-
-function writeStdout(obj) {
+async function handleMessage(msg) {
+  if (!plain(msg) || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string' ||
+      Object.keys(msg).some(k => !['jsonrpc', 'id', 'method', 'params'].includes(k)) ||
+      (own(msg, 'id') && !validId(msg.id))) return rpcError(-32600, 'Invalid Request');
+  if (!own(msg, 'id')) {
+    if (msg.method === 'notifications/initialized' && lifecycle === 'initializing') {
+      try { checkParams(msg.params === undefined ? {} : msg.params, []); lifecycle = 'ready'; } catch { /* Invalid notifications have no response. */ }
+    }
+    if (msg.method === 'notifications/cancelled' && plain(msg.params) && validId(msg.params.requestId)) {
+      const rec = rpcPending.get(JSON.stringify(msg.params.requestId));
+      if (rec && rec.method !== 'initialize') { rec.cancelled = true; rec.controller.abort(); }
+    }
+    return null;
+  }
+  if (msg.method.startsWith('notifications/')) return rpcError(-32600, '通知不能携带 id', msg.id);
+  const key = JSON.stringify(msg.id);
+  if (rpcPending.has(key)) return rpcError(-32600, '重复的在途请求 id', msg.id);
+  const rec = { controller: new AbortController(), cancelled: false, method: msg.method };
+  rpcPending.set(key, rec);
   try {
-    process.stdout.write(JSON.stringify(obj) + '\n');
+    const result = await dispatch(msg, rec.controller.signal);
+    return rec.cancelled ? null : { jsonrpc: '2.0', id: msg.id, result };
   } catch (e) {
-    log('写 stdout 失败（可能 stdout 已关闭）', e && e.message);
-  }
+    const code = e.code === 'METHOD_NOT_FOUND' ? -32601 : e.code === 'INVALID_PARAM' ? -32602 : e.code === 'INVALID_REQUEST' ? -32600 : e.code === 'NOT_INITIALIZED' ? -32002 : -32603;
+    return rec.cancelled ? null : rpcError(code, e.message, msg.id);
+  } finally { rpcPending.delete(key); }
 }
-
-// ---------------- 启动 ----------------
+function writeStdout(value) {
+  if (!shuttingDown && value !== null) process.stdout.write(JSON.stringify(value) + '\n');
+}
+async function processLine(bytes) {
+  let msg;
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    msg = JSON.parse(text);
+  } catch { writeStdout(rpcError(-32700, 'Parse error')); return; }
+  if (Array.isArray(msg)) {
+    if (negotiatedVersion !== '2025-03-26' || msg.length === 0 || msg.length > 100) { writeStdout(rpcError(-32600, '该协议版本不接受此批量请求')); return; }
+    const results = (await Promise.all(msg.map(handleMessage))).filter(x => x !== null);
+    if (results.length) writeStdout(results);
+  } else writeStdout(await handleMessage(msg));
+}
+function startStdio() {
+  let buffer = Buffer.alloc(0);
+  let discarding = false;
+  process.stdin.on('data', chunk => {
+    let start = 0;
+    for (let i = 0; i < chunk.length; i++) {
+      if (chunk[i] !== 10) continue;
+      const part = chunk.subarray(start, i);
+      if (!discarding && buffer.length + part.length <= MAX_STDIO_BYTES) {
+        const line = Buffer.concat([buffer, part]);
+        if (line.length) void processLine(line).catch(e => log('请求处理失败: ' + e.message));
+      } else if (!discarding) writeStdout(rpcError(-32600, 'stdio 消息超过 1MB 上限'));
+      buffer = Buffer.alloc(0); discarding = false; start = i + 1;
+    }
+    if (!discarding) {
+      const rest = chunk.subarray(start);
+      if (buffer.length + rest.length > MAX_STDIO_BYTES) {
+        buffer = Buffer.alloc(0); discarding = true;
+        writeStdout(rpcError(-32600, 'stdio 消息超过 1MB 上限'));
+      } else buffer = Buffer.concat([buffer, rest]);
+    }
+  });
+  process.stdin.on('end', () => shutdown(0));
+  process.stdin.on('error', () => shutdown(1));
+  process.stdout.on('error', () => shutdown(1));
+}
+function shutdown(code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(heartbeat);
+  for (const client of wss.clients) { drop(client); client.terminate(); }
+  wss.close();
+  void closeListeners().then(() => process.exit(code));
+  setTimeout(() => process.exit(code), 300).unref();
+}
+process.on('SIGINT', () => shutdown());
+process.on('SIGTERM', () => shutdown());
 
 async function main() {
-  startWsServer();
-  startStdioServer();
-  // 首次运行（从未成功配对）时生成 6 位配对码，打印到 stderr 供用户配对
-  if (!pairedOnce) generatePairCode();
-  log('MCP stdio server 已就绪（供 MCP agent 调用）');
-  log('审计日志: ' + AUDIT_FILE);
+  const flags = process.argv.slice(2);
+  if (flags.some(x => !['--show-pairing-key', '--rotate-token'].includes(x)) || flags.length > 1) throw error('INVALID_CONFIG', '只接受 --show-pairing-key 或 --rotate-token');
+  if (TEST_PORT !== undefined && (process.env.NODE_ENV !== 'test' || !process.env.FIGMA_BRIDGE_HOME || !Number.isSafeInteger(PORT) || PORT < 1024 || PORT > 65535)) throw error('INVALID_CONFIG', 'FIGMA_BRIDGE_TEST_PORT 仅允许使用临时 FIGMA_BRIDGE_HOME 的 NODE_ENV=test 测试进程');
+  if (process.env.FIGMA_BRIDGE_PORT !== undefined && process.env.FIGMA_BRIDGE_PORT !== '9753') throw error('INVALID_CONFIG', '此版本固定使用 127.0.0.1:9753，不支持自定义端口');
+  if (!Number.isSafeInteger(CMD_TIMEOUT_MS) || CMD_TIMEOUT_MS < 1 || CMD_TIMEOUT_MS > 300000) throw error('INVALID_CONFIG', 'FIGMA_BRIDGE_TIMEOUT_MS 必须为 1–300000 的整数');
+  if (flags.includes('--show-pairing-key')) {
+    // Explicit local CLI output, never an MCP method or a WebSocket message.
+    console.log(loadKey(false));
+    return;
+  }
+  await listen(httpServers[0], HOST);
+  try { await listen(httpServers[1], IPV6_HOST); }
+  catch (e) {
+    if (e.code !== 'EAFNOSUPPORT' && e.code !== 'EADDRNOTAVAIL') throw e;
+    log('此系统不支持 IPv6 回环地址，当前仅监听 127.0.0.1；localhost 必须可解析到 IPv4。');
+  }
+  // Rotation only occurs after this process owns every supported loopback listener.
+  bridgeKey = loadKey(flags.includes('--rotate-token'));
+  if (flags.includes('--rotate-token')) {
+    log('本机配对密钥已轮换；旧密钥失效。请重新显示密钥并在插件中忘记旧配对。');
+    await closeListeners();
+    return;
+  }
+  for (const server of httpServers) server.on('error', e => { log('桥接监听失败: ' + e.message); shutdown(1); });
+  startStdio();
+  log('MCP stdio 已就绪，插件地址 ws://localhost:' + PORT + '/plugin；回环监听: ' + listenHosts.join(', '));
+  log('需要配对时，在本机终端显式执行 node bridge/mcp-bridge.js --show-pairing-key');
 }
-
-function shutdown() {
-  try { wss.close(); } catch (e) { /* ignore */ }
-  try { httpServer.close(); } catch (e) { /* ignore */ }
-  process.exit(0);
-}
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-
-main().catch((e) => {
-  log('启动失败:', e && e.stack ? e.stack : e);
-  process.exit(1);
+main().catch(e => {
+  log(e.code === 'EADDRINUSE' ? '9753 端口已被占用；未修改密钥。请先退出其他桥接或 Agent。' : e.message);
+  shutdown(1);
 });

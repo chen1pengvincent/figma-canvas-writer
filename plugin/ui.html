@@ -1,222 +1,341 @@
-<!-- figma-canvas-writer/plugin/ui.html -->
-<!-- Figma Canvas Writer —— 插件面板（iframe，有 WebSocket）：连接桥接、配对、鉴权、命令中转 -->
 <!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>Figma Canvas Writer</title>
+<title>Figma Canvas Writer 2</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-    margin: 0; padding: 12px; font-size: 12px;
-    background: var(--figma-color-bg, #ffffff);
-    color: var(--figma-color-text, #1f1f1f);
-    user-select: none;
-  }
-  #statusRow { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: #b3b3b3; flex: none; }
-  .dot.ok { background: #0f9d58; }
-  .dot.bad { background: #ea4335; }
-  .dot.warn { background: #f9ab00; }
+  body { margin: 0; padding: 12px; font: 12px -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; background: var(--figma-color-bg,#fff); color: var(--figma-color-text,#1f1f1f); }
+  .panelTitle { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+  #statusRow { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #999; }
+  .dot.ok { background: #159447; } .dot.bad { background: #d83232; } .dot.warn { background: #e9a323; }
   #statusText { font-weight: 600; }
-  #detail { color: #777; margin-bottom: 10px; line-height: 1.4; min-height: 15px; word-break: break-all; }
-  label { display: block; margin-bottom: 4px; color: #666; }
-  input {
-    width: 100%; padding: 5px 6px;
-    border: 1px solid #d0d0d0; border-radius: 4px;
-    font-size: 12px; outline: none;
-    background: var(--figma-color-bg, #fff); color: var(--figma-color-text, #1f1f1f);
-  }
-  input:focus { border-color: #0d99ff; }
-  button {
-    margin-top: 8px; width: 100%; padding: 6px 0;
-    border: none; border-radius: 4px;
-    background: #0d99ff; color: #fff; font-size: 12px; cursor: pointer;
-  }
-  button:active { opacity: 0.85; }
-  .hint { margin-top: 8px; font-size: 11px; color: #888; line-height: 1.5; }
+  #detail { line-height: 1.45; min-height: 32px; margin-bottom: 8px; overflow-wrap: anywhere; }
+  label { display: block; margin-bottom: 5px; }
+  input { width: 100%; padding: 7px; border: 1px solid #aaa; border-radius: 4px; background: var(--figma-color-bg,#fff); color: inherit; }
+  button { padding: 7px 8px; margin-top: 8px; border: 0; border-radius: 4px; cursor: pointer; background: #0d77d9; color: #fff; }
+  #pairBtn { width: 100%; }
+  .actions { display: flex; gap: 6px; } .actions button { flex: 1; }
+  .hint { margin-top: 8px; font-size: 11px; line-height: 1.4; opacity: .7; }
 </style>
 </head>
 <body>
-  <div id="statusRow">
-    <span id="dot" class="dot"></span>
-    <span id="statusText">初始化…</span>
-  </div>
-  <div id="detail"></div>
-
-  <div id="pairArea">
-    <label for="pair">6 位配对码</label>
-    <input id="pair" type="text" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="桥接启动时 stderr 打印的 6 位数字" />
-    <button id="pairBtn">配对并连接</button>
-  </div>
-
-  <div class="hint">配对码由桥接首次启动时打印（10 分钟有效、单次）。配对成功后真 token 自动经本机通道下发并保存，无需复制。</div>
-
+<div class="panelTitle">Figma Canvas Writer 2</div>
+<div id="statusRow"><span id="dot" class="dot"></span><span id="statusText">初始化…</span></div>
+<div id="detail"></div>
+<div id="pairArea">
+  <label for="pair">本机配对密钥</label>
+  <input id="pair" type="password" maxlength="64" autocomplete="off" spellcheck="false" placeholder="粘贴本机终端显示的 64 位十六进制密钥" />
+  <button id="pairBtn">保存配对并连接</button>
+</div>
+<div class="actions"><button id="connectBtn">连接</button><button id="disconnectBtn">断开</button><button id="forgetBtn">忘记配对</button></div>
+<div class="hint">在本机终端运行 node bridge/mcp-bridge.js --show-pairing-key 查看密钥。密钥仅保存在本机，不通过网络发送。</div>
 <script>
-  // ============ Figma Canvas Writer UI（iframe，有 WebSocket）============
-  // 职责：建 WS 连桥接、配对/鉴权、把桥接命令转发给主线程(code.js)执行、结果回传桥接。
-  // 架构：桥接 ←WS→ 本 iframe ←postMessage→ code.js(主线程, Plugin API)
-
-  const BRIDGE_URL = 'ws://localhost:9753/plugin';
-  const PROTOCOL = 1;
-
-  let socket = null;
-  let token = '';
-  let bridgeUrl = BRIDGE_URL;
-  let reconnectDelay = 1000;
-  let reconnectTimer = null;
-  let pairPending = false;
-
-  // ---------- 状态显示 ----------
-  function mapStateText(s) {
-    return ({
-      idle: '未启动',
-      connecting: '连接中…',
-      connected: '已连接，鉴权中…',
-      authorized: '已授权（桥接在线）',
-      auth_failed: '鉴权失败',
-      disconnected: '已断开，自动重连中…',
-    }[s] || s);
+// Separate bootstrap: report main-script parse/startup failures without exposing payloads.
+(function () {
+  function report(message) {
+    var status = document.getElementById('statusText');
+    var detail = document.getElementById('detail');
+    var dot = document.getElementById('dot');
+    var safe = String(message || 'UI 启动失败').replace(/[0-9a-f]{64}/gi, '[已隐藏]').slice(0, 500);
+    if (status) status.textContent = '启动失败';
+    if (detail) detail.textContent = safe;
+    if (dot) dot.className = 'dot bad';
   }
-  function setState(state, detail) {
-    const dot = document.getElementById('dot');
-    document.getElementById('statusText').textContent = mapStateText(state);
-    if (state === 'authorized' || state === 'connected') dot.className = 'dot ok';
-    else if (state === 'auth_failed' || state === 'disconnected') dot.className = 'dot bad';
-    else if (state === 'connecting') dot.className = 'dot warn';
-    else dot.className = 'dot';
-    document.getElementById('detail').textContent = detail || '';
-  }
-  function hidePairArea() { document.getElementById('pairArea').style.display = 'none'; }
-
-  // ---------- 与主线程 code.js 通信 ----------
-  function toMain(msg) { parent.postMessage({ pluginMessage: msg }, '*'); }
-
-  // ---------- WebSocket 连接桥接 ----------
-  function scheduleReconnect() {
-    if (reconnectTimer) return;
-    reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
-  }
-
-  function connect() {
-    if (socket && (socket.readyState === 0 || socket.readyState === 1)) return;
-    setState('connecting', bridgeUrl);
-    let ws;
-    try { ws = new WebSocket(bridgeUrl); }
-    catch (e) { setState('disconnected', '无法创建 WebSocket: ' + (e && e.message)); scheduleReconnect(); return; }
-    socket = ws;
-
-    ws.onopen = () => {
-      reconnectDelay = 1000;
-      setState('connected', '已连接，正在鉴权…');
-      // 已有 token → 直接鉴权；否则若在配对中 → 发配对码
-      if (token) {
-        ws.send(JSON.stringify({ type: 'auth', protocol: PROTOCOL, token }));
-      } else if (pairPending) {
-        const code = document.getElementById('pair').value.trim();
-        ws.send(JSON.stringify({ type: 'pair', code }));
-      }
-    };
-
-    ws.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(String(ev.data)); } catch (e) { return; }
-      if (!msg || typeof msg !== 'object') return;
-
-      if (msg.type === 'pair_ack') {
-        if (msg.ok === true && typeof msg.token === 'string' && msg.token.length > 0) {
-          token = msg.token;
-          pairPending = false;
-          toMain({ type: 'saveToken', token }); // 持久化到主线程 clientStorage
-          setState('connected', '配对成功，正在鉴权…');
-          ws.send(JSON.stringify({ type: 'auth', protocol: PROTOCOL, token }));
-        } else {
-          pairPending = false;
-          setState('auth_failed', (msg.error && msg.error.message) || '配对失败');
-        }
-        return;
-      }
-
-      if (msg.type === 'auth_ack') {
-        if (msg.ok === true) { setState('authorized', '已授权（桥接在线）'); hidePairArea(); }
-        else setState('auth_failed', (msg.error && msg.error.message) || '鉴权失败');
-        return;
-      }
-
-      // 桥接命令 → 转发主线程执行
-      if (msg.type === 'cmd') {
-        toMain({ type: 'exec', id: msg.id, command: msg.command, params: msg.params });
-        return;
-      }
-    };
-
-    ws.onerror = () => { /* 交给 onclose */ };
-    ws.onclose = () => {
-      if (socket === ws) socket = null;
-      setState('disconnected', '连接断开，正在重连…');
-      scheduleReconnect();
-    };
-  }
-
-  // ---------- 主线程结果回传桥接 ----------
-  window.onmessage = (event) => {
-    const msg = event.data && event.data.pluginMessage;
-    if (!msg) return;
-
-    // code.js 执行结果 → 经 WS 回桥接
-    if (msg.type === 'exec_result') {
-      if (socket && socket.readyState === 1) {
-        const payload = msg.ok
-          ? { type: 'resp', id: msg.id, ok: true, data: msg.data }
-          : { type: 'resp', id: msg.id, ok: false, error: msg.error };
-        try { socket.send(JSON.stringify(payload)); } catch (e) { /* ignore */ }
-      }
-      return;
-    }
-
-    // code.js 启动时报告初始化状态（含是否已有 token）
-    if (msg.type === 'init') {
-      bridgeUrl = msg.bridgeUrl || BRIDGE_URL;
-      if (msg.hasToken) hidePairArea();
-      return;
-    }
-
-    // code.js 报告 token 读取结果（启动时）
-    if (msg.type === 'token') {
-      token = msg.token || '';
-      if (token) hidePairArea();
-      connect();
-      return;
-    }
-    if (msg.type === 'tokenCleared') {
-      token = '';
-      document.getElementById('pairArea').style.display = '';
-      return;
-    }
-    if (msg.type === 'saved') {
-      // token 已持久化, 无需动作
-      return;
-    }
-  };
-
-  // ---------- 配对按钮 ----------
-  document.getElementById('pairBtn').addEventListener('click', () => {
-    const code = document.getElementById('pair').value.trim();
-    if (!/^\d{6}$/.test(code)) { setState('auth_failed', '配对码必须是 6 位数字'); return; }
-    pairPending = true;
-    if (socket && socket.readyState === 1) {
-      socket.send(JSON.stringify({ type: 'pair', code }));
-    } else {
-      connect(); // 未连接则先连, onopen 里会发 pair
-    }
-    setState('connecting', '配对中…');
+  window.addEventListener('error', function (event) { report(event.message || 'UI 脚本执行失败'); });
+  window.addEventListener('unhandledrejection', function (event) {
+    report(event.reason && typeof event.reason.message === 'string' ? event.reason.message : 'UI 发生未处理的异步错误');
   });
+})();
+</script>
+<!-- FCW_CRYPTO_BEGIN -->
+<script>
+/* @noble/hashes 2.4.0 — MIT
+The MIT License (MIT)
 
-  // ---------- 启动：向主线程要已保存的 token，然后连接 ----------
-  toMain({ type: 'getToken' });
+Copyright (c) 2022 Paul Miller (https://paulmillr.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the “Software”), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+*/
+(()=>{var W=Object.defineProperty;var X=(e,t,n)=>t in e?W(e,t,{enumerable:!0,configurable:!0,writable:!0,value:n}):e[t]=n;var c=(e,t,n)=>X(e,typeof t!="symbol"?t+"":t,n);function O(e){return e instanceof Uint8Array||ArrayBuffer.isView(e)&&e.constructor.name==="Uint8Array"&&"BYTES_PER_ELEMENT"in e&&e.BYTES_PER_ELEMENT===1}var U=e=>e?`"${e}" `:"";function S(e,t=""){if(typeof e!="number")throw new TypeError(U(t)+"expected number, got "+typeof e);if(!Number.isSafeInteger(e)||e<0)throw new RangeError(U(t)+"expected integer >= 0, got "+e);return e}function w(e,t,n=""){if(O(e)&&(t===void 0||e.length===t))return e;t!==void 0&&S(t,"length");let r=O(e),o=t!==void 0?` of length ${t}`:"",s=r?`length=${e.length}`:`type=${typeof e}`,i=U(n)+"expected Uint8Array"+o+", got "+s;throw r?new RangeError(i):new TypeError(i)}function D(e){if(typeof e!="function"||typeof e.create!="function")throw new TypeError("expected hash wrapped by utils.createHasher");if(S(e.outputLen),S(e.blockLen),e.outputLen<1||e.blockLen<1)throw new Error("hash blockLen / outputLen must be >= 1")}var K=(e,t)=>{if(e===null||typeof e!="object"||Array.isArray(e))throw new TypeError((t==="object"?"":`"${t}" `)+"expected object, got type="+typeof e)},C=(e,t)=>{K(e,t);let n=Object.getPrototypeOf(e);if(n!==Object.prototype&&n!==null)throw new TypeError(`"${t}" expected plain object`);if(Object.hasOwn(e,"__proto__"))throw new TypeError(`"${t}.__proto__" is not allowed`)};function y(e,t=!0){if(e.destroyed)throw new Error("hash was destroyed");if(t&&e.finished)throw new Error("digest() was already called")}function m(e,t){w(e,void 0,"output");let n=t.outputLen;if(!(e.length>=n))throw new RangeError('"output" expected length >= '+n)}function H(...e){for(let t=0;t<e.length;t++)e[t].fill(0)}function A(e){return new DataView(e.buffer,e.byteOffset,e.byteLength)}function d(e,t){return e<<32-t|e>>>t}function P(e,t,n="opts"){return C(e,"defaults"),t!==void 0&&C(t,n),Object.assign(Object.create(null),e,t)}function j(e,t={}){if(typeof e!="function")throw new TypeError('"hashCons" expected function, got type='+typeof e);t=P({},t,"info");let n=(o,s)=>e(s).update(o).digest(),r=e(void 0);return n.outputLen=r.outputLen,n.blockLen=r.blockLen,n.canXOF=r.canXOF,n.create=o=>e(o),Object.assign(n,t),Object.freeze(n)}var k=e=>({oid:Uint8Array.from([6,9,96,134,72,1,101,3,4,2,e])});var L=class{constructor(t,n){c(this,"oHash");c(this,"iHash");c(this,"blockLen");c(this,"outputLen");c(this,"canXOF",!1);c(this,"finished",!1);c(this,"destroyed",!1);if(D(t),w(n,void 0,"key"),this.iHash=t.create(),typeof this.iHash.update!="function")throw new Error("expected Hash instance");this.blockLen=this.iHash.blockLen,this.outputLen=this.iHash.outputLen;let r=this.blockLen,o=new Uint8Array(r);o.set(n.length>r?t.create().update(n).digest():n);for(let s=0;s<o.length;s++)o[s]^=54;this.iHash.update(o),this.oHash=t.create();for(let s=0;s<o.length;s++)o[s]^=106;this.oHash.update(o),H(o)}update(t){return y(this),this.iHash.update(t),this}digestInto(t){y(this),m(t,this),this.finished=!0;let n=t.subarray(0,this.outputLen);this.iHash.digestInto(n),this.oHash.update(n),this.oHash.digestInto(n),this.destroy()}digest(){let t=new Uint8Array(this.oHash.outputLen);return this.digestInto(t),t}_cloneInto(t){t||(t=Object.create(Object.getPrototypeOf(this),{}));let{oHash:n,iHash:r,finished:o,destroyed:s,blockLen:i,outputLen:a,canXOF:f}=this;return t=t,t.finished=o,t.destroyed=s,t.blockLen=i,t.outputLen=a,t.canXOF=f,t.oHash=n._cloneInto(t.oHash),t.iHash=r._cloneInto(t.iHash),t}clone(){return this._cloneInto()}destroy(){this.destroyed=!0,this.oHash.destroy(),this.iHash.destroy()}},G=(()=>{let e=((t,n,r)=>new L(t,n).update(r).digest());return e.create=(t,n)=>new L(t,n),e})();var z=e=>e/2**32|0,J=e=>e>>>0;function I(e,t,n,r){let o=z(n),s=J(n);e.setUint32(t,r?s:o,r),e.setUint32(t+4,r?o:s,r)}function $(e,t,n){return e&t^~e&n}function M(e,t,n){return e&t^e&n^t&n}var E=class{constructor(t,n,r,o){c(this,"blockLen");c(this,"outputLen");c(this,"canXOF",!1);c(this,"padOffset");c(this,"isLE");c(this,"buffer");c(this,"view");c(this,"finished",!1);c(this,"length",0);c(this,"pos",0);c(this,"destroyed",!1);this.blockLen=t,this.outputLen=n,this.padOffset=r,this.isLE=o,this.buffer=new Uint8Array(t),this.view=A(this.buffer)}update(t){y(this),w(t);let{view:n,buffer:r,blockLen:o}=this,s=t.length,i=!1;for(let a=0;a<s;){let f=Math.min(o-this.pos,s-a);if(f===o){let x=A(t);for(;o<=s-a;a+=o)this.process(x,a);i=!0;continue}r.set(a===0&&f===s?t:t.subarray(a,a+f),this.pos),this.pos+=f,a+=f,this.pos===o&&(this.process(n,0),this.pos=0,i=!0)}return this.length+=t.length,i&&this.roundClean(),this}digestInto(t){y(this),m(t,this),this.finished=!0;let{buffer:n,view:r,blockLen:o,isLE:s}=this,{pos:i}=this;n[i++]=128,n.fill(0,i),this.padOffset>o-i&&(this.process(r,0),n.fill(0)),I(r,o-8,this.length*8,s),this.process(r,0),this.roundClean();let a=t===n?r:A(t),f=this.outputLen,x=f/4,b=this.get();if(f%4||x>b.length)throw new Error("invalid outputLen");for(let u=0;u<x;u++)a.setUint32(4*u,b[u],s)}digest(){let{buffer:t,outputLen:n}=this;this.digestInto(t);let r=t.slice(0,n);return this.destroy(),r}_cloneIntoMeta(t){let{buffer:n,length:r,finished:o,destroyed:s,pos:i}=this;return t.destroyed=s,t.finished=o,t.length=r,t.pos=i,i&&t.buffer.set(n),t}clone(){return this._cloneInto()}},R=Uint32Array.from([1779033703,3144134277,1013904242,2773480762,1359893119,2600822924,528734635,1541459225]);var Y=Uint32Array.from([1116352408,1899447441,3049323471,3921009573,961987163,1508970993,2453635748,2870763221,3624381080,310598401,607225278,1426881987,1925078388,2162078206,2614888103,3248222580,3835390401,4022224774,264347078,604807628,770255983,1249150122,1555081692,1996064986,2554220882,2821834349,2952996808,3210313671,3336571891,3584528711,113926993,338241895,666307205,773529912,1294757372,1396182291,1695183700,1986661051,2177026350,2456956037,2730485921,2820302411,3259730800,3345764771,3516065817,3600352804,4094571909,275423344,430227734,506948616,659060556,883997877,958139571,1322822218,1537002063,1747873779,1955562222,2024104815,2227730452,2361852424,2428436474,2756734187,3204031479,3329325298]),l=new Uint32Array(64),_=class extends E{constructor(n,r){super(64,n,8,!1);c(this,"A",0);c(this,"B",0);c(this,"C",0);c(this,"D",0);c(this,"E",0);c(this,"F",0);c(this,"G",0);c(this,"H",0);this.A=r[0]|0,this.B=r[1]|0,this.C=r[2]|0,this.D=r[3]|0,this.E=r[4]|0,this.F=r[5]|0,this.G=r[6]|0,this.H=r[7]|0}get(){let{A:n,B:r,C:o,D:s,E:i,F:a,G:f,H:x}=this;return[n,r,o,s,i,a,f,x]}set(n,r,o,s,i,a,f,x){this.A=n|0,this.B=r|0,this.C=o|0,this.D=s|0,this.E=i|0,this.F=a|0,this.G=f|0,this.H=x|0}_cloneInto(n){return(n||(n=new this.constructor)).set(...this.get()),this._cloneIntoMeta(n)}process(n,r){for(let h=0;h<16;h++,r+=4)l[h]=n.getUint32(r,!1);for(let h=16;h<64;h++){let g=l[h-15],p=l[h-2],F=d(g,7)^d(g,18)^g>>>3,B=d(p,17)^d(p,19)^p>>>10;l[h]=B+l[h-7]+F+l[h-16]|0}let{A:o,B:s,C:i,D:a,E:f,F:x,G:b,H:u}=this;for(let h=0;h<64;h++){let g=d(f,6)^d(f,11)^d(f,25),p=u+g+$(f,x,b)+Y[h]+l[h]|0,B=(d(o,2)^d(o,13)^d(o,22))+M(o,s,i)|0;u=b,b=x,x=f,f=a+p|0,a=i,i=s,s=o,o=p+B|0}o=o+this.A|0,s=s+this.B|0,i=i+this.C|0,a=a+this.D|0,f=f+this.E|0,x=x+this.F|0,b=b+this.G|0,u=u+this.H|0,this.set(o,s,i,a,f,x,b,u)}roundClean(){H(l)}destroy(){this.destroyed=!0,this.set(0,0,0,0,0,0,0,0),H(this.buffer)}},T=class extends _{constructor(){super(32,R)}};var N=j(()=>new T,k(1));window.FCWCrypto=Object.freeze({hmacSha256(e,t){return G(N,e,t)},equalBytes(e,t){if(!(e instanceof Uint8Array)||!(t instanceof Uint8Array)||e.length!==t.length)return!1;let n=0;for(let r=0;r<e.length;r++)n|=e[r]^t[r];return n===0}});})();
+</script>
+<!-- FCW_CRYPTO_END -->
+<script>
+'use strict';
+const BRIDGE_URL = 'ws://localhost:9753/plugin';
+const PROTOCOL = 2;
+const DOMAIN = 'figma-canvas-writer/v2';
+const HEX64 = /^[0-9a-f]{64}$/i;
+const MAX_MSG_BYTES = 256 * 1024;
+const encoder = new TextEncoder();
+let token = '';
+let cryptoKey = null;
+let context = null;
+let connection = null;
+let generation = 0;
+let keyRevision = 0;
+let wantConnected = true;
+let userTouchedKey = false;
+let pendingSave = false;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+const executions = new Map();
+
+function plain(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); }
+function canonical(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(x => x === undefined ? 'null' : canonical(x)).join(',') + ']';
+  return '{' + Object.keys(v).filter(k => v[k] !== undefined).sort().map(k => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+}
+function normalizeContext(v) {
+  if (!plain(v)) throw new Error('尚未取得 Figma 页面上下文');
+  const out = {};
+  for (const k of ['sessionId', 'pageId', 'pageName', 'fileName']) {
+    if (typeof v[k] !== 'string' || v[k].length > 1024 || ((k === 'sessionId' || k === 'pageId') && !v[k])) throw new Error('页面上下文不合法');
+    out[k] = v[k];
+  }
+  if (v.editorType !== undefined) {
+    if (v.editorType !== 'figma') throw new Error('仅支持 Figma Design 文件');
+    out.editorType = v.editorType;
+  }
+  return out;
+}
+function authProof(kind, serverNonce, clientNonce, ctx, connectionId) {
+  return { domain: DOMAIN, kind, protocol: PROTOCOL, serverNonce, clientNonce, context: ctx, ...(connectionId === undefined ? {} : { connectionId }) };
+}
+function frameProof(direction, connectionId, seq, payload) {
+  return { domain: DOMAIN, kind: direction + '-frame', connectionId, seq, payload };
+}
+function hex(bytes) { return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(''); }
+function unhex(s) { return new Uint8Array(s.match(/../g).map(x => parseInt(x, 16))); }
+function macBytes(key, value) {
+  const digest = window.FCWCrypto.hmacSha256(key, encoder.encode(canonical(value)));
+  if (!(digest instanceof Uint8Array) || digest.length !== 32) throw new Error('本地签名组件返回格式不合法');
+  return digest;
+}
+async function sign(key, value) { return hex(macBytes(key, value)); }
+async function verify(key, value, mac) {
+  return typeof mac === 'string' && HEX64.test(mac) && window.FCWCrypto.equalBytes(macBytes(key, value), unhex(mac)) === true;
+}
+function toMain(msg) { parent.postMessage({ pluginMessage: msg }, '*'); }
+function setState(state, detail) {
+  const states = { idle: '已断开', waiting: '等待配对', connecting: '连接中…', connected: '正在验证本机桥接…', authorized: '已授权', auth_failed: '连接未获授权', disconnected: '已断开，等待重连…' };
+  document.getElementById('statusText').textContent = states[state] || state;
+  document.getElementById('detail').textContent = detail || '';
+  document.getElementById('dot').className = 'dot' + (state === 'authorized' ? ' ok' : state === 'auth_failed' ? ' bad' : state === 'connecting' || state === 'connected' ? ' warn' : '');
+}
+function showPair(show) { document.getElementById('pairArea').style.display = show ? '' : 'none'; }
+function current(c) { return connection === c && c.generation === generation && wantConnected; }
+function clearReconnect() { if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = null; }
+function detach(reason) {
+  clearReconnect();
+  const c = connection;
+  connection = null;
+  generation++;
+  executions.clear();
+  if (c) {
+    c.authed = false;
+    clearTimeout(c.authTimer);
+    try { c.ws.close(1000, reason || 'disconnect'); } catch {}
+  }
+}
+function stop(reason, revoke) {
+  wantConnected = false;
+  detach(reason);
+  if (revoke) toMain({ type: 'revoke' });
+}
+function fail(c, message) {
+  if (!current(c)) return;
+  stop('auth failure', false);
+  setState('auth_failed', message);
+  showPair(true);
+}
+function scheduleReconnect() {
+  if (!wantConnected || reconnectTimer || !cryptoKey || !context) return;
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+}
+async function setKey(value, save) {
+  const rev = ++keyRevision;
+  if (!HEX64.test(value)) throw new Error('配对密钥必须是 64 位十六进制字符');
+  if (typeof globalThis.crypto?.getRandomValues !== 'function') throw new Error('当前环境缺少安全随机数，已拒绝建立连接');
+  if (typeof window.FCWCrypto?.hmacSha256 !== 'function' || typeof window.FCWCrypto?.equalBytes !== 'function') throw new Error('本地签名组件未加载，请重新导入完整插件');
+  const imported = unhex(value);
+  if (rev !== keyRevision) return;
+  token = value.toLowerCase();
+  cryptoKey = imported;
+  pendingSave = save;
+  showPair(false);
+  if (wantConnected) connect();
+}
+function connect() {
+  if (!wantConnected || connection) return;
+  if (!context) { setState('waiting', '等待当前 Figma 页面信息'); return; }
+  if (!cryptoKey) { setState('waiting', '请先粘贴本机配对密钥'); showPair(true); return; }
+  clearReconnect();
+  const c = {
+    generation: ++generation, key: cryptoKey, context: { ...context }, authed: false,
+    serverNonce: null, clientNonce: null, connectionId: null, recvSeq: 0, sendSeq: 0,
+    receiveQueue: Promise.resolve(), sendQueue: Promise.resolve(),
+  };
+  connection = c;
+  setState('connecting', context.fileName + ' / ' + context.pageName);
+  try { c.ws = new WebSocket(BRIDGE_URL); } catch (e) { connection = null; setState('disconnected', e.message); scheduleReconnect(); return; }
+  c.authTimer = setTimeout(() => fail(c, '本机桥接未完成双向验证，请确认桥接正在运行'), 10000);
+  c.ws.onopen = () => { if (current(c)) setState('connected', '双方验证通过后才可读写当前页面'); };
+  c.ws.onmessage = ev => {
+    c.receiveQueue = c.receiveQueue.then(async () => {
+      if (!current(c)) return;
+      if (typeof ev.data !== 'string' || encoder.encode(ev.data).length > MAX_MSG_BYTES) throw new Error('桥接消息过大或格式不合法');
+      const msg = JSON.parse(ev.data);
+      if (!plain(msg)) throw new Error('桥接消息不合法');
+      if (!c.authed) {
+        if (msg.type === 'challenge' && !c.serverNonce) {
+          if (msg.protocol !== PROTOCOL || typeof msg.serverNonce !== 'string' || !HEX64.test(msg.serverNonce)) throw new Error('桥接协议不匹配');
+          c.serverNonce = msg.serverNonce;
+          c.clientNonce = hex(crypto.getRandomValues(new Uint8Array(32)));
+          const proof = await sign(c.key, authProof('client-auth', c.serverNonce, c.clientNonce, c.context));
+          if (current(c) && c.ws.readyState === 1) c.ws.send(JSON.stringify({ type: 'auth', protocol: PROTOCOL, serverNonce: c.serverNonce, clientNonce: c.clientNonce, context: c.context, proof }));
+          return;
+        }
+        if (msg.type === 'auth_ack' && c.serverNonce) {
+          if (msg.ok !== true) throw new Error(msg.error?.code === 'PLUGIN_BUSY' ? '另一个插件已连接，请先断开该插件，再点击连接' : '密钥验证失败，请核对本机配对密钥');
+          if (msg.protocol !== PROTOCOL || typeof msg.connectionId !== 'string' || !HEX64.test(msg.connectionId) ||
+              !await verify(c.key, authProof('server-auth', c.serverNonce, c.clientNonce, c.context, msg.connectionId), msg.proof)) throw new Error('无法验证桥接身份，已拒绝连接');
+          if (!current(c)) return;
+          c.connectionId = msg.connectionId;
+          c.authed = true;
+          clearTimeout(c.authTimer);
+          reconnectDelay = 1000;
+          setState('authorized', c.context.fileName + ' / ' + c.context.pageName);
+          showPair(false);
+          if (pendingSave) { pendingSave = false; toMain({ type: 'saveToken', token }); }
+          return;
+        }
+        throw new Error('收到鉴权前命令或非法握手，已拒绝连接');
+      }
+      if (msg.type !== 'frame' || msg.connectionId !== c.connectionId || !Number.isSafeInteger(msg.seq) ||
+          msg.seq !== c.recvSeq + 1 || !plain(msg.payload) ||
+          !await verify(c.key, frameProof('server', msg.connectionId, msg.seq, msg.payload), msg.mac)) throw new Error('命令签名或序号无效，已断开连接');
+      if (!current(c) || !c.authed) return;
+      c.recvSeq = msg.seq;
+      const p = msg.payload;
+      if (p.type !== 'cmd' || typeof p.id !== 'string' || !p.id ||
+          p.sessionId !== c.context.sessionId || p.pageId !== c.context.pageId ||
+          typeof p.command !== 'string' || !plain(p.params) || executions.has(p.id) ||
+          Object.keys(p).some(k => !['type', 'id', 'sessionId', 'pageId', 'operationId', 'command', 'params'].includes(k))) throw new Error('命令目标或格式不合法');
+      if (['createNode', 'modifyNode', 'deleteNode', 'setText'].includes(p.command) &&
+          (typeof p.operationId !== 'string' || !p.operationId || p.operationId.length > 128)) throw new Error('写入缺少 operationId');
+      if (executions.size >= 100) throw new Error('在途命令数量过多');
+      executions.set(p.id, c);
+      toMain({ type: 'exec', id: p.id, sessionId: p.sessionId, pageId: p.pageId,
+        ...(p.operationId === undefined ? {} : { operationId: p.operationId }), command: p.command, params: p.params });
+    }).catch(e => fail(c, e.message));
+  };
+  c.ws.onerror = () => {};
+  c.ws.onclose = () => {
+    clearTimeout(c.authTimer);
+    if (connection !== c) return;
+    connection = null;
+    generation++;
+    executions.clear();
+    c.authed = false;
+    if (wantConnected) { setState('disconnected', '桥接断开；写入超时后请查询原 operationId'); scheduleReconnect(); }
+  };
+}
+function sendResult(msg) {
+  const c = executions.get(msg.id);
+  executions.delete(msg.id);
+  if (!c || !current(c) || !c.authed || c.ws.readyState !== 1) return;
+  c.sendQueue = c.sendQueue.then(async () => {
+    if (!current(c) || !c.authed || c.ws.readyState !== 1) return;
+    const payload = msg.ok === true
+      ? { type: 'resp', id: msg.id, ok: true, data: msg.data === undefined ? null : msg.data }
+      : { type: 'resp', id: msg.id, ok: false, error: msg.error || { code: 'PLUGIN_ERROR', message: '插件未提供错误详情' } };
+    const seq = ++c.sendSeq;
+    const frame = { type: 'frame', connectionId: c.connectionId, seq, payload,
+      mac: await sign(c.key, frameProof('client', c.connectionId, seq, payload)) };
+    const text = JSON.stringify(frame);
+    if (encoder.encode(text).length > MAX_MSG_BYTES) throw new Error('插件结果超过 256KB，请缩小读取范围并查询在途写入状态');
+    if (current(c) && c.authed && c.ws.readyState === 1) c.ws.send(text);
+  }).catch(e => fail(c, e.message));
+}
+
+window.onmessage = event => {
+  // Figma Desktop dispatches Plugin API messages from its top-level editor window.
+  if (event.source !== window.top || !['https://www.figma.com', 'https://figma.com'].includes(event.origin)) return;
+  const msg = event.data?.pluginMessage;
+  if (!plain(msg)) return;
+  if (msg.type === 'exec_result') { sendResult(msg); return; }
+  if (msg.type === 'init' || msg.type === 'context') {
+    try {
+      const next = normalizeContext(msg.context);
+      const changed = context && canonical(context) !== canonical(next);
+      context = next;
+      if (changed) detach('context changed');
+      if (wantConnected) connect();
+    } catch (e) { stop('invalid context', false); setState('auth_failed', e.message); }
+    return;
+  }
+  if (msg.type === 'token') {
+    if (userTouchedKey) return;
+    if (typeof msg.token === 'string' && msg.token) {
+      setKey(msg.token, false).catch(e => { setState('auth_failed', e.message); showPair(true); });
+    } else { showPair(true); setState('waiting', '粘贴本机配对密钥后连接'); }
+    return;
+  }
+  if (msg.type === 'saved' && msg.ok !== true) setState('authorized', '本次连接已授权，但保存配对失败；下次需重新粘贴密钥');
+  if (msg.type === 'tokenCleared') {
+    if (msg.ok === false) setState('auth_failed', '已断开，但清除已保存配对失败，请重试忘记配对');
+    else setState('waiting', '已忘记配对；粘贴新的本机密钥后连接');
+  }
+};
+document.getElementById('pairBtn').addEventListener('click', () => {
+  userTouchedKey = true;
+  const value = document.getElementById('pair').value.trim();
+  document.getElementById('pair').value = '';
+  detach('new pairing');
+  wantConnected = true;
+  setKey(value, true).catch(e => { wantConnected = false; setState('auth_failed', e.message); showPair(true); });
+});
+document.getElementById('connectBtn').addEventListener('click', () => {
+  wantConnected = true;
+  reconnectDelay = 1000;
+  connect();
+});
+document.getElementById('disconnectBtn').addEventListener('click', () => {
+  stop('user disconnect', true);
+  setState('idle', '已停止本次授权；点击连接可重新授权');
+});
+document.getElementById('forgetBtn').addEventListener('click', () => {
+  userTouchedKey = true;
+  ++keyRevision;
+  stop('forget pairing', true);
+  token = ''; cryptoKey = null; pendingSave = false;
+  document.getElementById('pair').value = '';
+  showPair(true);
+  toMain({ type: 'clearToken' });
+  setState('waiting', '已断开，正在清除已保存配对');
+});
+toMain({ type: 'getToken' });
 </script>
 </body>
 </html>
