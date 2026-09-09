@@ -4,7 +4,7 @@
 // values for unread fields.
 import { LIMITS } from '../../shared/limits.js';
 import { appErr, requireStr, requireNum, onlyKeys, isPlainObject, buildNodeInfo, cloneValue,
-  utf16SafeBoundary, summarizeText, simpleTextDigest, pageOfNode } from './util.js';
+  utf16SafeBoundary, summarizeText, simpleTextDigest, pageOfNode, utf8ByteLength } from './util.js';
 import { getNode, getContext } from './context.js';
 import { createCursor, readCursor, touchCursor } from './records.js';
 
@@ -256,14 +256,41 @@ async function handleReadField(p, t) {
     if (!p.fields.includes('characters')) throw appErr('INVALID_PARAM', 'range 仅适用于 characters 字段');
     range = { start, end };
   }
+  // Cross-node byte budget: per-field values are already capped, but
+  // nodeCount x fieldCount is not — without this gate the response can grow
+  // far beyond the frame limit and kill the connection.
+  const budgetBytes = LIMITS.READFIELD_BUDGET_BYTES;
+  let usedBytes = 0;
   const results = [];
+  const omittedNodeIds = [];
+  let truncated = false;
   for (const id of p.nodeIds) {
     const node = await getNode(id, t);
     const fields = {};
     for (const key of p.fields) fields[key] = readFieldValue(node, key, range);
-    results.push({ id: node.id, fields });
+    const entry = { id: node.id, fields };
+    const entryBytes = utf8ByteLength(entry);
+    if (usedBytes + entryBytes > budgetBytes && results.length) {
+      omittedNodeIds.push(node.id);
+      truncated = true;
+      continue;
+    }
+    if (entryBytes > budgetBytes) {
+      // 单节点即超预算：字段降级为 omitted 标记，仍返回该节点条目
+      const slimFields = {};
+      for (const key of p.fields) slimFields[key] = { status: 'truncated', reason: 'response-budget' };
+      const slimEntry = { id: node.id, fields: slimFields };
+      results.push(slimEntry);
+      usedBytes += utf8ByteLength(slimEntry);
+      truncated = true;
+      continue;
+    }
+    results.push(entry);
+    usedBytes += entryBytes;
   }
-  return { results, ...getContext() };
+  return { results, truncated: truncated || undefined,
+    omittedNodeIds: omittedNodeIds.length ? omittedNodeIds : undefined,
+    readFieldBudgetBytes: truncated ? budgetBytes : undefined, ...getContext() };
 }
 
 // ---- getTextRuns ------------------------------------------------------------

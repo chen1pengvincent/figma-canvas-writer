@@ -457,7 +457,24 @@ async function sendSigned(c, payload) {
         const frame = { type: 'frame', connectionId: c.connectionId, seq, payload,
           mac: await sign(c.key, frameProof('client', c.connectionId, seq, payload)) };
         const text = JSON.stringify(frame);
-        if (encoder.encode(text).length > MAX_MSG_BYTES) throw new Error('插件消息超过 256KB');
+        if (encoder.encode(text).length > MAX_MSG_BYTES) {
+          if (payload.type === 'resp') {
+            // Safety net: an oversized result must not kill the connection.
+            // Reuse the same seq (the oversized frame was never sent) and
+            // answer with a compact error resp the bridge can settle cleanly.
+            const errorPayload = { type: 'resp', id: payload.id, ok: false,
+              error: { code: 'RESPONSE_TOO_LARGE', state: 'unknown',
+                message: '响应超过 256KB 帧上限，已由安全网替换为错误帧；请缩小读取范围或按节点回读' } };
+            const errorFrame = { type: 'frame', connectionId: c.connectionId, seq, payload: errorPayload,
+              mac: await sign(c.key, frameProof('client', c.connectionId, seq, errorPayload)) };
+            const errorText = JSON.stringify(errorFrame);
+            if (encoder.encode(errorText).length > MAX_MSG_BYTES) throw new Error('插件消息超过 256KB');
+            if (current(c) && c.authed && c.ws.readyState === 1) c.ws.send(errorText);
+            resolve();
+            return;
+          }
+          throw new Error('插件消息超过 256KB');
+        }
         if (current(c) && c.authed && c.ws.readyState === 1) c.ws.send(text);
         resolve();
       } catch (e) { reject(e); throw e; }

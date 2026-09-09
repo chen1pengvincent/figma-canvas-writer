@@ -24,11 +24,11 @@ export const domainMeta = {
     '样式应用优先 set*StyleIdAsync，缺失时退回 *StyleId 属性赋值',
     'combineAsVariants 需要 nodeIds(2..64)、createInstance 需要 parentId，共享注册表 figma_components 暂无这两个字段，线上调用会被 schema 拒绝（待契约修订）',
     'variables 的 value 在共享注册表中限定为 object，FLOAT/BOOLEAN/STRING 原始值会在 schema 层被拒（待契约修订）',
-    '列表返回截断 + truncated 标记，响应预算 ≤256KiB（LIMITS.FRAME_BYTES）',
+    '列表返回截断 + truncated 标记，响应预算 ≤RESPONSE_BUDGET_BYTES（200KiB，与执行器全局闸门同源）',
   ],
 };
 
-const BUDGET_BYTES = LIMITS.FRAME_BYTES - 2048;
+const BUDGET_BYTES = LIMITS.RESPONSE_BUDGET_BYTES;
 const RESOLVED_TYPES = ['BOOLEAN', 'FLOAT', 'COLOR', 'STRING'];
 const STYLE_TYPES = ['PAINT', 'TEXT', 'EFFECT', 'GRID'];
 const STYLE_GETTERS = {

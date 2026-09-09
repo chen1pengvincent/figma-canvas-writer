@@ -1,6 +1,6 @@
 {
   "name": "figma-canvas-writer-bridge",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "description": "单客户端 MCP stdio 桥接服务（协议 3），将经本地授权的工具调用转发给 Figma Design/FigJam/Slides 插件。",
   "type": "module",
   "private": true,

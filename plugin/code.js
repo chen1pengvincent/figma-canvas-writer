@@ -755,6 +755,50 @@
     return !!set && !!params && set.includes(params.action);
   }
 
+  // shared/limits.js
+  var LIMITS = {
+    FRAME_BYTES: 256 * 1024,
+    STDIO_BYTES: 1024 * 1024,
+    CHUNK_RAW_BYTES: 64 * 1024,
+    RESOURCE_BYTES: 16 * 1024 * 1024,
+    CONCURRENT_TRANSFERS: 2,
+    UNACKED_CHUNKS: 4,
+    STAGING_BYTES: 64 * 1024 * 1024,
+    TRANSFER_IDLE_MS: 3e4,
+    TRANSFER_TOTAL_MS: 12e4,
+    BITMAP_PIXELS: 16777216,
+    PREVIEW_LONG_EDGE: 1600,
+    PREVIEW_LONG_EDGE_MAX: 8192,
+    QUERY_PAGE_IDS: 100,
+    ACTIVE_HANDLES: 16,
+    HANDLE_MEMBER_IDS: 1e4,
+    HANDLE_BUDGET_BYTES: 8 * 1024 * 1024,
+    HANDLE_TTL_MS: 12e4,
+    BATCH_STEPS: 50,
+    OPERATION_RECORDS: 1e3,
+    OPERATION_RECORD_BYTES: 8 * 1024 * 1024,
+    PENDING_REQUESTS: 100,
+    PENDING_CONTROL_RESERVED: 8,
+    INLINE_PREVIEW_BYTES: 128 * 1024,
+    TEXT_CHUNK_CHARS: 16e3,
+    // Response-size gate: the signed frame limit is 256KiB; results are
+    // compacted well below it so one oversized reply can never kill the
+    // connection (and never loops through getOperation replay).
+    RESPONSE_BUDGET_BYTES: 200 * 1024,
+    BATCH_STEP_DATA_BYTES: 2048,
+    READFIELD_BUDGET_BYTES: 200 * 1024,
+    AFFECTED_IDS_CAP: 500
+  };
+  var BATCH_EXCLUDED_COMMANDS = /* @__PURE__ */ new Set([
+    "managePage",
+    "exportAsset",
+    "importAsset",
+    "exportVideo",
+    "batch",
+    "getOperation",
+    "getCapabilities"
+  ]);
+
   // shared/schema-validator.js
   var own = (v, k) => Object.prototype.hasOwnProperty.call(v, k);
   var isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -1051,6 +1095,17 @@
     if (text.length <= maxChars * 2) return text;
     return { length: text.length, head: text.slice(0, maxChars), tail: text.slice(-maxChars) };
   }
+  var byteEncoder = typeof TextEncoder === "function" ? new TextEncoder() : null;
+  function utf8ByteLength(value) {
+    const serialized = JSON.stringify(value ?? null);
+    if (byteEncoder) return byteEncoder.encode(serialized).length;
+    let bytes = serialized.length;
+    for (let i = 0; i < serialized.length; i++) {
+      const code = serialized.charCodeAt(i);
+      if (code > 127) bytes += code > 2047 ? 2 : 1;
+    }
+    return bytes;
+  }
   function simpleTextDigest(text) {
     if (typeof text !== "string") return null;
     let hash = 5381;
@@ -1135,43 +1190,6 @@
     t.mutating = true;
     if (node && !t.affected.includes(node.id)) t.affected.push(node.id);
   }
-
-  // shared/limits.js
-  var LIMITS = {
-    FRAME_BYTES: 256 * 1024,
-    STDIO_BYTES: 1024 * 1024,
-    CHUNK_RAW_BYTES: 64 * 1024,
-    RESOURCE_BYTES: 16 * 1024 * 1024,
-    CONCURRENT_TRANSFERS: 2,
-    UNACKED_CHUNKS: 4,
-    STAGING_BYTES: 64 * 1024 * 1024,
-    TRANSFER_IDLE_MS: 3e4,
-    TRANSFER_TOTAL_MS: 12e4,
-    BITMAP_PIXELS: 16777216,
-    PREVIEW_LONG_EDGE: 1600,
-    PREVIEW_LONG_EDGE_MAX: 8192,
-    QUERY_PAGE_IDS: 100,
-    ACTIVE_HANDLES: 16,
-    HANDLE_MEMBER_IDS: 1e4,
-    HANDLE_BUDGET_BYTES: 8 * 1024 * 1024,
-    HANDLE_TTL_MS: 12e4,
-    BATCH_STEPS: 50,
-    OPERATION_RECORDS: 1e3,
-    OPERATION_RECORD_BYTES: 8 * 1024 * 1024,
-    PENDING_REQUESTS: 100,
-    PENDING_CONTROL_RESERVED: 8,
-    INLINE_PREVIEW_BYTES: 128 * 1024,
-    TEXT_CHUNK_CHARS: 16e3
-  };
-  var BATCH_EXCLUDED_COMMANDS = /* @__PURE__ */ new Set([
-    "managePage",
-    "exportAsset",
-    "importAsset",
-    "exportVideo",
-    "batch",
-    "getOperation",
-    "getCapabilities"
-  ]);
 
   // plugin/src/records.js
   function canonical(value) {
@@ -1856,14 +1874,41 @@
       if (!p.fields.includes("characters")) throw appErr("INVALID_PARAM", "range \u4EC5\u9002\u7528\u4E8E characters \u5B57\u6BB5");
       range = { start, end };
     }
+    const budgetBytes = LIMITS.READFIELD_BUDGET_BYTES;
+    let usedBytes = 0;
     const results = [];
+    const omittedNodeIds = [];
+    let truncated = false;
     for (const id of p.nodeIds) {
       const node = await getNode(id, t);
       const fields = {};
       for (const key of p.fields) fields[key] = readFieldValue(node, key, range);
-      results.push({ id: node.id, fields });
+      const entry = { id: node.id, fields };
+      const entryBytes = utf8ByteLength(entry);
+      if (usedBytes + entryBytes > budgetBytes && results.length) {
+        omittedNodeIds.push(node.id);
+        truncated = true;
+        continue;
+      }
+      if (entryBytes > budgetBytes) {
+        const slimFields = {};
+        for (const key of p.fields) slimFields[key] = { status: "truncated", reason: "response-budget" };
+        const slimEntry = { id: node.id, fields: slimFields };
+        results.push(slimEntry);
+        usedBytes += utf8ByteLength(slimEntry);
+        truncated = true;
+        continue;
+      }
+      results.push(entry);
+      usedBytes += entryBytes;
     }
-    return { results, ...getContext() };
+    return {
+      results,
+      truncated: truncated || void 0,
+      omittedNodeIds: omittedNodeIds.length ? omittedNodeIds : void 0,
+      readFieldBudgetBytes: truncated ? budgetBytes : void 0,
+      ...getContext()
+    };
   }
   function textOf(node) {
     const value = node.characters;
@@ -3892,10 +3937,10 @@
       "\u6837\u5F0F\u5E94\u7528\u4F18\u5148 set*StyleIdAsync\uFF0C\u7F3A\u5931\u65F6\u9000\u56DE *StyleId \u5C5E\u6027\u8D4B\u503C",
       "combineAsVariants \u9700\u8981 nodeIds(2..64)\u3001createInstance \u9700\u8981 parentId\uFF0C\u5171\u4EAB\u6CE8\u518C\u8868 figma_components \u6682\u65E0\u8FD9\u4E24\u4E2A\u5B57\u6BB5\uFF0C\u7EBF\u4E0A\u8C03\u7528\u4F1A\u88AB schema \u62D2\u7EDD\uFF08\u5F85\u5951\u7EA6\u4FEE\u8BA2\uFF09",
       "variables \u7684 value \u5728\u5171\u4EAB\u6CE8\u518C\u8868\u4E2D\u9650\u5B9A\u4E3A object\uFF0CFLOAT/BOOLEAN/STRING \u539F\u59CB\u503C\u4F1A\u5728 schema \u5C42\u88AB\u62D2\uFF08\u5F85\u5951\u7EA6\u4FEE\u8BA2\uFF09",
-      "\u5217\u8868\u8FD4\u56DE\u622A\u65AD + truncated \u6807\u8BB0\uFF0C\u54CD\u5E94\u9884\u7B97 \u2264256KiB\uFF08LIMITS.FRAME_BYTES\uFF09"
+      "\u5217\u8868\u8FD4\u56DE\u622A\u65AD + truncated \u6807\u8BB0\uFF0C\u54CD\u5E94\u9884\u7B97 \u2264RESPONSE_BUDGET_BYTES\uFF08200KiB\uFF0C\u4E0E\u6267\u884C\u5668\u5168\u5C40\u95F8\u95E8\u540C\u6E90\uFF09"
     ]
   };
-  var BUDGET_BYTES = LIMITS.FRAME_BYTES - 2048;
+  var BUDGET_BYTES = LIMITS.RESPONSE_BUDGET_BYTES;
   var RESOLVED_TYPES = ["BOOLEAN", "FLOAT", "COLOR", "STRING"];
   var STYLE_TYPES = ["PAINT", "TEXT", "EFFECT", "GRID"];
   var STYLE_GETTERS = {
@@ -4832,6 +4877,17 @@
     }
     return params;
   }
+  function slimStepData(data) {
+    if (utf8ByteLength(data) <= LIMITS.BATCH_STEP_DATA_BYTES) return data;
+    const slim = {};
+    if (isPlainObject2(data)) {
+      if (typeof data.id === "string") slim.id = data.id;
+      if (typeof data.name === "string") slim.name = data.name;
+    }
+    slim.stepDataOmitted = true;
+    slim.stepDataBytes = utf8ByteLength(data);
+    return slim;
+  }
   async function handleBatch(p, t) {
     if (!Array.isArray(p.steps) || p.steps.length < 1 || p.steps.length > LIMITS.BATCH_STEPS) {
       throw appErr("INVALID_PARAM", `steps \u6570\u91CF\u5FC5\u987B\u5728 1\u2013${LIMITS.BATCH_STEPS}`);
@@ -4867,7 +4923,7 @@
         const params = substituteRefs(step.params, stepResults);
         const data = await HANDLERS[step.command](params, t, { operationId: null });
         stepResults.push(data);
-        results.push({ step: index, command: step.command, status: "succeeded", data });
+        results.push({ step: index, command: step.command, status: "succeeded", data: slimStepData(data) });
       } catch (e) {
         results.push({
           step: index,
@@ -5746,10 +5802,44 @@
         throw appErr("INVALID_PARAM", "\u5199\u5165\u7F3A\u5C11 operationId");
       }
       const data = await HANDLERS[msg.command](msg.params, t, msg);
-      return { ok: true, data: write ? { ...data, state: "succeeded", operationId: msg.operationId, affectedNodeIds: t.affected } : data };
+      let envelope = write ? { ...data, state: "succeeded", operationId: msg.operationId, affectedNodeIds: t.affected } : data;
+      const responseBytes = utf8ByteLength(envelope);
+      if (responseBytes > LIMITS.RESPONSE_BUDGET_BYTES) {
+        if (write) envelope = compactWriteEnvelope(envelope, responseBytes);
+        else throw appErr(
+          "RESPONSE_TOO_LARGE",
+          `\u54CD\u5E94 ${responseBytes} \u5B57\u8282\u8D85\u8FC7 ${LIMITS.RESPONSE_BUDGET_BYTES} \u9884\u7B97\uFF1B\u8BF7\u7F29\u5C0F\u8BFB\u53D6\u8303\u56F4\uFF08\u5982\u51CF\u5C11 nodeIds/\u5B57\u6BB5\u3001\u964D\u4F4E depth\uFF09`
+        );
+      }
+      return { ok: true, data: envelope };
     } catch (e) {
       return failure(e, t);
     }
+  }
+  function compactWriteEnvelope(envelope, bytes) {
+    const compact = {};
+    if (isPlainObject2(envelope)) {
+      if (typeof envelope.id === "string") compact.id = envelope.id;
+      if (typeof envelope.name === "string") compact.name = envelope.name;
+    }
+    compact.state = "succeeded";
+    compact.operationId = envelope.operationId;
+    const affected = Array.isArray(envelope.affectedNodeIds) ? envelope.affectedNodeIds : [];
+    compact.affectedNodeIds = affected.slice(0, LIMITS.AFFECTED_IDS_CAP);
+    if (affected.length > LIMITS.AFFECTED_IDS_CAP) compact.affectedNodeIdsTruncated = true;
+    compact.resultOmitted = true;
+    compact.resultBytes = bytes;
+    compact.resultHint = "\u54CD\u5E94\u8D85\u8FC7\u9884\u7B97\u88AB\u7701\u7565\uFF1B\u8BF7\u7528 figma_get_node / figma_read_field \u6309\u8282\u70B9\u56DE\u8BFB";
+    return compact;
+  }
+  function compactReplayResult(result) {
+    const bytes = utf8ByteLength(result);
+    if (bytes <= LIMITS.RESPONSE_BUDGET_BYTES) return { result };
+    return { result: {
+      resultOmitted: true,
+      resultBytes: bytes,
+      resultHint: "\u8BB0\u5F55\u7ED3\u679C\u8D85\u8FC7\u9884\u7B97\u88AB\u7701\u7565\uFF1B\u8BF7\u7528 figma_get_node / figma_read_field \u6309\u8282\u70B9\u56DE\u8BFB"
+    } };
   }
   async function runVideoJob(msg) {
     const job = getJob(msg.operationId);
@@ -5784,7 +5874,7 @@
         const job = getJob(id);
         if (job) {
           if (job.target && job.target.sessionId !== msg.sessionId) throw appErr("OPERATION_TARGET_MISMATCH", "\u64CD\u4F5C\u5C5E\u4E8E\u53E6\u4E00\u76EE\u6807");
-          reply({ ok: true, data: { operationId: id, state: job.state, jobId: id, result: job.result } });
+          reply({ ok: true, data: { operationId: id, state: job.state, jobId: id, ...compactReplayResult(job.result) } });
           return;
         }
         const rec = getOperation(id);
@@ -5792,7 +5882,7 @@
           reply(failure(appErr("OPERATION_TARGET_MISMATCH", "\u64CD\u4F5C\u5C5E\u4E8E\u53E6\u4E00\u76EE\u6807"), t));
           return;
         }
-        reply({ ok: true, data: rec ? { operationId: id, state: rec.state, result: rec.result || null } : { operationId: id, state: "not_found" } });
+        reply({ ok: true, data: rec ? { operationId: id, state: rec.state, ...compactReplayResult(rec.result || null) } : { operationId: id, state: "not_found" } });
       } catch (e) {
         reply(failure(e, t));
       }
@@ -5814,7 +5904,13 @@
           if (canonical(existing.params) !== canonical(msg.params)) {
             throw appErr("OPERATION_CONFLICT", "\u540C\u4E00\u4E2A operationId \u4E0D\u80FD\u7528\u4E8E\u4E0D\u540C\u64CD\u4F5C");
           }
-          reply({ ok: true, data: { operationId: id, state: existing.state, jobId: id, result: existing.result, ...getContext() } });
+          reply({ ok: true, data: {
+            operationId: id,
+            state: existing.state,
+            jobId: id,
+            ...compactReplayResult(existing.result),
+            ...getContext()
+          } });
           return;
         }
         createJob(id, { params: msg.params, target: { sessionId: msg.sessionId, pageId: msg.pageId } });

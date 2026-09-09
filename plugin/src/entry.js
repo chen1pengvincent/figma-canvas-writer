@@ -1,8 +1,9 @@
 // Plugin main-thread entry: dispatch, serialized execution, operation
 // records, jobs, batch and capability aggregation. Bundled into plugin/code.js.
 import { TOOLS, isWriteCall } from '../../shared/tool-registry.js';
+import { LIMITS } from '../../shared/limits.js';
 import { validateSchema } from '../../shared/schema-validator.js';
-import { appErr, requireStr, isPlainObject } from './util.js';
+import { appErr, requireStr, isPlainObject, utf8ByteLength } from './util.js';
 import { getContext, assertTarget, assertAuthGeneration, makeTarget, rotateSession, bumpPageRevision } from './context.js';
 import { canonical, operationCapacity, reserveOperation, getOperation, operationRecordKey,
   createJob, getJob, updateJob, addOperationBytes, operationBudgetAvailable, clearAllRecords } from './records.js';
@@ -120,9 +121,44 @@ async function execute(msg, t) {
       throw appErr('INVALID_PARAM', '写入缺少 operationId');
     }
     const data = await HANDLERS[msg.command](msg.params, t, msg);
-    return { ok: true, data: write
-      ? { ...data, state: 'succeeded', operationId: msg.operationId, affectedNodeIds: t.affected } : data };
+    let envelope = write
+      ? { ...data, state: 'succeeded', operationId: msg.operationId, affectedNodeIds: t.affected }
+      : data;
+    // Response-size gate: the write DID succeed; an oversized result must not
+    // kill the connection nor poison the getOperation replay. Compact it and
+    // point the caller at the targeted read commands instead.
+    const responseBytes = utf8ByteLength(envelope);
+    if (responseBytes > LIMITS.RESPONSE_BUDGET_BYTES) {
+      if (write) envelope = compactWriteEnvelope(envelope, responseBytes);
+      else throw appErr('RESPONSE_TOO_LARGE',
+        `响应 ${responseBytes} 字节超过 ${LIMITS.RESPONSE_BUDGET_BYTES} 预算；请缩小读取范围（如减少 nodeIds/字段、降低 depth）`);
+    }
+    return { ok: true, data: envelope };
   } catch (e) { return failure(e, t); }
+}
+
+function compactWriteEnvelope(envelope, bytes) {
+  const compact = {};
+  if (isPlainObject(envelope)) {
+    if (typeof envelope.id === 'string') compact.id = envelope.id;
+    if (typeof envelope.name === 'string') compact.name = envelope.name;
+  }
+  compact.state = 'succeeded';
+  compact.operationId = envelope.operationId;
+  const affected = Array.isArray(envelope.affectedNodeIds) ? envelope.affectedNodeIds : [];
+  compact.affectedNodeIds = affected.slice(0, LIMITS.AFFECTED_IDS_CAP);
+  if (affected.length > LIMITS.AFFECTED_IDS_CAP) compact.affectedNodeIdsTruncated = true;
+  compact.resultOmitted = true;
+  compact.resultBytes = bytes;
+  compact.resultHint = '响应超过预算被省略；请用 figma_get_node / figma_read_field 按节点回读';
+  return compact;
+}
+
+function compactReplayResult(result) {
+  const bytes = utf8ByteLength(result);
+  if (bytes <= LIMITS.RESPONSE_BUDGET_BYTES) return { result };
+  return { result: { resultOmitted: true, resultBytes: bytes,
+    resultHint: '记录结果超过预算被省略；请用 figma_get_node / figma_read_field 按节点回读' } };
 }
 
 async function runVideoJob(msg) {
@@ -160,7 +196,7 @@ async function dispatch(msg) {
       const job = getJob(id);
       if (job) {
         if (job.target && job.target.sessionId !== msg.sessionId) throw appErr('OPERATION_TARGET_MISMATCH', '操作属于另一目标');
-        reply({ ok: true, data: { operationId: id, state: job.state, jobId: id, result: job.result } });
+        reply({ ok: true, data: { operationId: id, state: job.state, jobId: id, ...compactReplayResult(job.result) } });
         return;
       }
       const rec = getOperation(id);
@@ -168,7 +204,8 @@ async function dispatch(msg) {
         reply(failure(appErr('OPERATION_TARGET_MISMATCH', '操作属于另一目标'), t));
         return;
       }
-      reply({ ok: true, data: rec ? { operationId: id, state: rec.state, result: rec.result || null }
+      reply({ ok: true, data: rec
+        ? { operationId: id, state: rec.state, ...compactReplayResult(rec.result || null) }
         : { operationId: id, state: 'not_found' } });
     } catch (e) { reply(failure(e, t)); }
     return;
@@ -185,7 +222,8 @@ async function dispatch(msg) {
         if (canonical(existing.params) !== canonical(msg.params)) {
           throw appErr('OPERATION_CONFLICT', '同一个 operationId 不能用于不同操作');
         }
-        reply({ ok: true, data: { operationId: id, state: existing.state, jobId: id, result: existing.result, ...getContext() } });
+        reply({ ok: true, data: { operationId: id, state: existing.state, jobId: id,
+          ...compactReplayResult(existing.result), ...getContext() } });
         return;
       }
       createJob(id, { params: msg.params, target: { sessionId: msg.sessionId, pageId: msg.pageId } });

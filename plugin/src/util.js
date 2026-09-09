@@ -156,6 +156,21 @@ export function summarizeText(text, maxChars = 64) {
   return { length: text.length, head: text.slice(0, maxChars), tail: text.slice(-maxChars) };
 }
 
+const byteEncoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
+// Byte-accurate size of a JSON-serializable value (UTF-8), matching what the
+// WebSocket frame check measures. Falls back to a CJK-aware estimate when the
+// realm lacks TextEncoder.
+export function utf8ByteLength(value) {
+  const serialized = JSON.stringify(value ?? null);
+  if (byteEncoder) return byteEncoder.encode(serialized).length;
+  let bytes = serialized.length;
+  for (let i = 0; i < serialized.length; i++) {
+    const code = serialized.charCodeAt(i);
+    if (code > 0x7f) bytes += code > 0x7ff ? 2 : 1;
+  }
+  return bytes;
+}
+
 export function simpleTextDigest(text) {
   if (typeof text !== 'string') return null;
   // Content marker strong enough to detect any realistic edit: length, a

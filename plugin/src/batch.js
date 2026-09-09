@@ -2,7 +2,7 @@
 // prior creation results via the string form "step{index}.id".
 import { LIMITS, BATCH_EXCLUDED_COMMANDS } from '../../shared/limits.js';
 import { isWriteCall } from '../../shared/tool-registry.js';
-import { appErr, isPlainObject } from './util.js';
+import { appErr, isPlainObject, utf8ByteLength } from './util.js';
 import { assertTarget } from './context.js';
 import { HANDLERS, pluginSchemaFor } from './entry.js';
 import { validateSchema } from '../../shared/schema-validator.js';
@@ -40,6 +40,18 @@ function substituteRefs(params, results) {
   return params;
 }
 
+function slimStepData(data) {
+  if (utf8ByteLength(data) <= LIMITS.BATCH_STEP_DATA_BYTES) return data;
+  const slim = {};
+  if (isPlainObject(data)) {
+    if (typeof data.id === 'string') slim.id = data.id;
+    if (typeof data.name === 'string') slim.name = data.name;
+  }
+  slim.stepDataOmitted = true;
+  slim.stepDataBytes = utf8ByteLength(data);
+  return slim;
+}
+
 export async function handleBatch(p, t) {
   if (!Array.isArray(p.steps) || p.steps.length < 1 || p.steps.length > LIMITS.BATCH_STEPS) {
     throw appErr('INVALID_PARAM', `steps 数量必须在 1–${LIMITS.BATCH_STEPS}`);
@@ -73,7 +85,9 @@ export async function handleBatch(p, t) {
       const params = substituteRefs(step.params, stepResults);
       const data = await HANDLERS[step.command](params, t, { operationId: null });
       stepResults.push(data);
-      results.push({ step: index, command: step.command, status: 'succeeded', data });
+      // Per-step slimming: keep step statuses even for huge readbacks (the
+      // executor's global gate stays as the backstop).
+      results.push({ step: index, command: step.command, status: 'succeeded', data: slimStepData(data) });
     } catch (e) {
       results.push({ step: index, command: step.command, status: 'failed',
         error: { code: e.code || 'PLUGIN_ERROR', message: e.message || String(e) } });

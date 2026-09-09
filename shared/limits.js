@@ -25,6 +25,13 @@ export const LIMITS = {
   PENDING_CONTROL_RESERVED: 8,
   INLINE_PREVIEW_BYTES: 128 * 1024,
   TEXT_CHUNK_CHARS: 16000,
+  // Response-size gate: the signed frame limit is 256KiB; results are
+  // compacted well below it so one oversized reply can never kill the
+  // connection (and never loops through getOperation replay).
+  RESPONSE_BUDGET_BYTES: 200 * 1024,
+  BATCH_STEP_DATA_BYTES: 2048,
+  READFIELD_BUDGET_BYTES: 200 * 1024,
+  AFFECTED_IDS_CAP: 500,
 };
 
 // Commands that move page context or touch host files never run inside a batch.

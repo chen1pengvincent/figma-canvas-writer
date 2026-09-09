@@ -41,6 +41,17 @@ v3 出现问题时可整成回退到上一个 v2 tag 的桥接与插件（密钥
 
 本地子集限制：SVG 导入为有界解析子集（脚本/外链/嵌入内容拒绝）；Slides 内容节点限 FRAME/RECTANGLE/ELLIPSE/TEXT/LINE；Shader 仅列举与读取；MP4 仅顶层带动画 Frame，上限 4K。
 
+## 5.1 v3.1.1 补丁：超大响应不再断连（2026-09-09）
+
+**问题**：批量写入等多结果命令的响应可远超 256KiB 帧上限（实测 50 步批量 = 2.4MB、readField 100 节点 = 4.8MB），插件回帧失败即断开整条连接；且 `figma_get_operation` 重放完整记录会再次超限，形成重连-断开死循环。
+
+**修复**（向后兼容，协议不变）：
+- 执行器全局响应预算闸门（200KiB）：写入成功但结果超限时压缩为 `{state, operationId, affectedNodeIds, resultOmitted, resultBytes, resultHint}`，对账记录同步变小——**重放死循环消失**；读取超限返回明确的 `RESPONSE_TOO_LARGE` 错误。
+- batch 每步数据瘦身（保留 id/name + stepDataOmitted 标记），逐步状态不再丢失。
+- readField 增加跨节点字节预算：超限优雅截断（omittedNodeIds + truncated 标记）。
+- 插件 UI 安全网：超限响应改发紧凑错误帧（同一 seq），**连接不再因超大结果断开**。
+- 设计系统列表裁剪预算与全局闸门同源（消除双源冲突）。
+
 ## 5. 验收状态对账摘要（随版本更新）
 
 | 能力域 | 自动化测试 | 真实 Figma 画布（2026-09-08 验收记录） |
