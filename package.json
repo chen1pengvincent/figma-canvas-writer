@@ -1,0 +1,10 @@
+{
+  "name": "figma-canvas-writer",
+  "version": "3.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs",
+    "doctor": "node scripts/doctor.mjs"
+  }
+}

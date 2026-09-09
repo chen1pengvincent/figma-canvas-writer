@@ -267,7 +267,7 @@ function connect() {
   setState('connecting', context.fileName + ' / ' + context.pageName);
   try { c.ws = new WebSocket(BRIDGE_URL); } catch (e) { connection = null; setState('disconnected', e.message); scheduleReconnect(); return; }
   c.authTimer = setTimeout(() => fail(c, '本机桥接未完成双向验证，请确认桥接正在运行'), 10000);
-  c.ws.onopen = () => { if (current(c)) setState('connected', '双方验证通过后才可读写当前页面'); };
+  c.ws.onopen = () => { if (current(c)) setState('connected', 'WebSocket 已连接，等待桥接握手（10 秒超时）…'); };
   c.ws.onmessage = ev => {
     c.receiveQueue = c.receiveQueue.then(async () => {
       if (!current(c)) return;
@@ -276,7 +276,10 @@ function connect() {
       if (!plain(msg)) throw new Error('桥接消息不合法');
       if (!c.authed) {
         if (msg.type === 'challenge' && !c.serverNonce) {
-          if (msg.protocol !== PROTOCOL || typeof msg.serverNonce !== 'string' || !HEX64.test(msg.serverNonce)) throw new Error('桥接协议不匹配，请更新桥接与插件到同一版本');
+          if (msg.protocol !== PROTOCOL || typeof msg.serverNonce !== 'string' || !HEX64.test(msg.serverNonce)) {
+            throw new Error('桥接协议不匹配：对端为协议 ' + (typeof msg.protocol === 'number' ? msg.protocol : '未知（可能不是本项目的桥）') +
+              '，插件需要协议 ' + PROTOCOL + '。请升级桥接与插件到同一版本，或运行 node scripts/doctor.mjs 检查 9753 占用者');
+          }
           c.serverNonce = msg.serverNonce;
           c.clientNonce = hex(crypto.getRandomValues(new Uint8Array(32)));
           const proof = await sign(c.key, authProof('client-auth', c.serverNonce, c.clientNonce, c.context));

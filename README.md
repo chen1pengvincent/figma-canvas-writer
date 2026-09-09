@@ -44,6 +44,17 @@ v3 相比 v2 的核心扩展：工具从 9 个增加到 **37 个**，新增语�
 
 6. 让 Agent 调用 `figma_canvas_status`，确认 `data.authorized === true`，核对 `data.context`（文件名、页面名、`editorType`）。**之后所有目标工具都要求 `sessionId`、`pageId`、`pageRevision`**——三者都来自最新一次状态读取；切页（手动或工具）后必须重新读取。
 
+## 预检与验收（doctor / smoke）
+
+```sh
+node scripts/doctor.mjs        # 只读预检：Node/ws/localhost 解析顺序/配对密钥/9753 占用者身份/Figma 运行状态
+npm run smoke                  # 五步冒烟：授权 → 建节点 → 截图 → 删除 → 清理（退出码 0/1/2）
+```
+
+- doctor **纯只读**：对 9753 占用者做 WS 握手探针并按 challenge 协议号分类（本项目 v3 桥 / 旧版本桥 / 非本协议服务），配合 lsof 显示 PID 与命令行；不做密钥级握手。
+- smoke 自带桥接进程并要求插件已授权；`--json` 输出机器可读结果；任何失败都会清理测试节点。
+- Agent 与 Figma Desktop 分离部署（SSH 隧道 / 双栈中继、launchd/systemd 模板、明文链路警告与回环校验硬约束）见 [`docs/split-host.md`](docs/split-host.md)。
+
 ## 工具与调用约定
 
 所有工具返回 MCP 文本内容（JSON）。业务成功 `{ "ok": true, "data": ... }`；执行失败 `{ "ok": false, "error": ... }` 且 `isError: true`。
